@@ -35,11 +35,12 @@ ARG MARKET_FILE=market.example.toml
 
 # `openssh-server` and `iproute2` are not optional in a Firecracker guest:
 # /init.sh brings eth0 up with `ip` from the kernel's `ip=` parameter, and sshd
-# is what backs `heyctl exec` and `heyctl shell` into the VM. Without them the
-# VM boots unreachable and undebuggable.
+# is what backs `heyctl exec` and `heyctl shell` into the VM, and `socat` is
+# what the heyo host uses to exec into the guest and tail its logs. Without
+# them the VM boots unreachable and undebuggable.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl openssh-server iproute2 iputils-ping procps \
+        ca-certificates curl openssh-server iproute2 iputils-ping procps socat \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home crm
 
