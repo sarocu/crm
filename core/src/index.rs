@@ -173,18 +173,30 @@ fn state_settings() -> Settings {
         .with_sortable_attributes(["priority", "discovered_at", "updated_at"])
 }
 
+/// Every index and the settings it should have, in creation order.
+///
+/// Public so the settings can be applied without running a service: the
+/// `print_settings` example renders them as JSON for a one-off `PATCH`.
+pub fn all_settings(market: &MarketConfig) -> Vec<(&'static str, Settings)> {
+    vec![
+        (COMPANIES, company_settings(market)),
+        (SIGNALS, signal_settings(market)),
+        (ACCOUNTS, account_settings(market)),
+        (ACTIVITIES, activity_settings(market)),
+        (COMPANY_REQUESTS, request_settings()),
+        (PORTFOLIOS, portfolio_settings()),
+        (BOT_STATE, state_settings()),
+    ]
+}
+
 /// Create any missing index with `id` as its primary key and apply settings.
 ///
 /// Safe to call concurrently from several services: creating an index that
 /// already exists is tolerated.
 pub async fn ensure_indexes(client: &Client, market: &MarketConfig) -> Result<()> {
-    ensure_one(client, COMPANIES, &company_settings(market)).await?;
-    ensure_one(client, SIGNALS, &signal_settings(market)).await?;
-    ensure_one(client, ACCOUNTS, &account_settings(market)).await?;
-    ensure_one(client, ACTIVITIES, &activity_settings(market)).await?;
-    ensure_one(client, COMPANY_REQUESTS, &request_settings()).await?;
-    ensure_one(client, PORTFOLIOS, &portfolio_settings()).await?;
-    ensure_one(client, BOT_STATE, &state_settings()).await?;
+    for (uid, settings) in all_settings(market) {
+        ensure_one(client, uid, &settings).await?;
+    }
     tracing::info!(
         market = %market.name,
         verticals = market.verticals.len(),

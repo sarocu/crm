@@ -1,0 +1,43 @@
+{
+  "id": "prospectmcp",
+  "namespace": "samcurrie",
+  "routes": [{ "host": "prospectmcp.us2.heyo.work" }],
+  "health": { "path": "/healthz", "timeout_secs": 5 },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 2,
+    "warm_pool": 0,
+    "target_concurrency": 32,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 180,
+    "boot_timeout_secs": 600,
+    "drain_timeout_secs": 30,
+    "idle_action": "destroy"
+  },
+  "build": {
+    "repo": "https://github.com/sarocu/crm.git",
+    "ref": "crm-pivot",
+    "dockerfile": "mcp/Dockerfile",
+    "context": ".",
+    "image_name": "prospectmcp",
+    "image_size_mb": 1024
+  },
+  "vm": {
+    "driver": "firecracker",
+    "port": 8080,
+    "size_class": "small",
+    "env_vars": {
+      "PORT": "8080",
+      "BIND_HOST": "0.0.0.0",
+      "MARKET_CONFIG": "/etc/crm/market.toml",
+      "RUST_LOG": "info",
+      "MEILI_URL": "https://crmdata.us2.heyo.work",
+      "MEILI_READ_KEY": "<crm-mcp-read key; see deploy/create-mcp-keys.sh>",
+      "MEILI_WRITE_KEY": "<crm-mcp-write key; see deploy/create-mcp-keys.sh>",
+      "MCP_TOKENS": "bdr-agent:<bearer token>",
+      "MCP_ALLOWED_HOSTS": "prospectmcp.us2.heyo.work"
+    },
+    "start_command": "setsid nohup /usr/local/bin/mcp </dev/null >>/var/log/mcp.log 2>&1 &",
+    "ttl_seconds": 3600
+  }
+}
