@@ -5,6 +5,9 @@
 # matches. EDGAR and Wikidata only sweep companies in a vertical; a company
 # the crawler or add_company brings in without one is kept but untagged.
 #
+# `portfolios` are investors whose portfolio companies are swept in: the
+# YC directory, or any VC's portfolio page.
+#
 # `profiles` are ideal customer profiles. The MCP server's `find_prospects`
 # scores companies against one, and `get_company` scores against all of them.
 #
@@ -63,12 +66,51 @@ feeds = []
 [[verticals]]
 slug = "vertical-saas"
 name = "Vertical SaaS"
-aliases = ["saas", "software"]
+# YC tags companies "B2B", "SaaS", "Developer Tools"; those labels land in a
+# company's industries and match these aliases.
+aliases = ["saas", "software", "b2b", "developer tools", "enterprise software"]
 sic = ["7372", "7373", "7374"]
 naics = ["5112", "518210", "541511"]
 wikidata = []
 keywords = ["saas", "platform", "api", "software for"]
 feeds = []
+
+# Investors whose portfolios are swept. `kind = "yc"` reads the YC company
+# directory as JSON; `kind = "page"` reads any portfolio web page and takes
+# each outbound company link, optionally scoped by a CSS `selector`. Pages
+# that render their grid with JavaScript yield nothing; use a static one.
+[[portfolios]]
+slug = "yc"
+investor = "Y Combinator"
+kind = "yc"
+url = "https://yc-oss.github.io/api/companies/all.json"
+statuses = ["Active", "Public"]
+since_year = 2018
+
+[[portfolios]]
+slug = "usv"
+investor = "Union Square Ventures"
+kind = "page"
+url = "https://www.usv.com/companies"
+
+# The grid links to Sequoia's own page per company; each is visited for the
+# company's website, a slice per run.
+[[portfolios]]
+slug = "sequoia"
+investor = "Sequoia Capital"
+kind = "page"
+url = "https://www.sequoiacap.com/our-companies/"
+detail_selector = "a[href*='companies/']"
+
+# A portfolio published as JSON:
+# [[portfolios]]
+# slug = "example-vc"
+# investor = "Example Ventures"
+# kind = "json"
+# url = "https://example-vc.test/api/portfolio.json"
+# items = "/companies"
+# name_field = "/name"
+# website_field = "/url"
 
 [[profiles]]
 slug = "mid-market-ops"
@@ -93,3 +135,16 @@ employees = { min = 20, max = 500 }
 keywords = ["series a", "series b", "revenue operations", "hubspot", "salesforce"]
 signals = { hiring_roles = ["sales", "revenue operations", "account executive", "sdr", "bdr"], recency_days = 60 }
 weights = { vertical = 2, size = 2, geo = 0.5, hiring = 4, news = 2, keywords = 1 }
+
+[[profiles]]
+slug = "yc-b2b"
+name = "Venture-backed B2B"
+description = "Recently funded B2B startups building out their team."
+aliases = ["yc", "startups"]
+verticals = ["vertical-saas"]
+investors = ["Y Combinator"]
+countries = ["US"]
+employees = { min = 5, max = 200 }
+keywords = ["hubspot", "salesforce", "stripe"]
+signals = { hiring_roles = ["sales", "revenue operations", "customer success", "marketing"], recency_days = 90 }
+weights = { vertical = 2, size = 2, geo = 1, hiring = 4, news = 3, keywords = 1 }

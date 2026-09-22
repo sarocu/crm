@@ -396,6 +396,8 @@ fn company_facts(c: &Company) -> Markup {
             @if !hq.is_empty() { dt { "HQ" } dd { (hq.join(", ")) } }
             @if let Some(y) = c.founded { dt { "Founded" } dd { (y) } }
             @if let Some(t) = &c.ticker { dt { "Ticker" } dd { (t) } }
+            @if !c.investors.is_empty() { dt { "Investors" } dd { (c.investors.join(", ")) } }
+            @if let Some(b) = &c.cohort { dt { "Cohort" } dd { (b) } }
             @if !c.tech.is_empty() { dt { "Tech" } dd { (c.tech.join(", ")) } }
             @if let (Some(p), Some(s)) = (&c.ats_provider, &c.ats_slug) { dt { "Job board" } dd { (p) "/" (s) } }
             dt { "Sources" } dd { (c.sources.join(", ")) }

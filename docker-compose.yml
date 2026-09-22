@@ -38,7 +38,8 @@ services:
       CRAWL_SEEDS: ${CRAWL_SEEDS:-}
       NEWS_FEEDS: ${NEWS_FEEDS:-}
       SOURCE_INTERVALS: ${SOURCE_INTERVALS:-}
-      DISABLED_SOURCES: ${DISABLED_SOURCES:-}
+      # EDGAR is off unless this names something else; set it empty to run everything.
+      DISABLED_SOURCES: ${DISABLED_SOURCES-edgar}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8081:8081"

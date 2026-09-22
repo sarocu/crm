@@ -94,6 +94,13 @@ pub struct SearchCompaniesArgs {
     /// Tech seen on their site: ["netsuite", "shopify"].
     #[serde(default)]
     pub tech: Option<Vec<String>>,
+    /// Backed by any of these investors: ["Y Combinator"]. Portfolio slugs
+    /// from describe_market work too.
+    #[serde(default)]
+    pub investors: Option<Vec<String>>,
+    /// Accelerator cohort, e.g. ["Summer 2026"].
+    #[serde(default)]
+    pub cohorts: Option<Vec<String>>,
     /// "relevance" (default with a query), "recent_signal" (default
     /// without), "employees" or "name".
     #[serde(default)]
@@ -265,6 +272,10 @@ impl CrmServer {
             .facet(COMPANIES, "verticals", LIVE)
             .await
             .unwrap_or_default();
+        let by_investor = st
+            .facet(COMPANIES, "investors", LIVE)
+            .await
+            .unwrap_or_default();
         let pipeline = st.facet(ACCOUNTS, "status", "").await.unwrap_or_default();
         let recent = st
             .facet(
@@ -297,6 +308,11 @@ impl CrmServer {
                 "slug": p.slug,
                 "name": p.name,
                 "description": p.description,
+            })).collect::<Vec<_>>(),
+            "portfolios": m.portfolios.iter().map(|p| json!({
+                "slug": p.slug,
+                "investor": p.investor,
+                "companies": by_investor.get(&p.investor).copied().unwrap_or(0),
             })).collect::<Vec<_>>(),
             "pipeline": pipeline,
             "signals_last_90_days": recent,
@@ -392,6 +408,12 @@ impl CrmServer {
         if let Some(t) = &args.tech {
             let lower: Vec<String> = t.iter().map(|x| x.trim().to_lowercase()).collect();
             f.any_of("tech", &lower);
+        }
+        if let Some(i) = &args.investors {
+            f.any_of("investors", &self.investors(i));
+        }
+        if let Some(c) = &args.cohorts {
+            f.any_of("cohort", c);
         }
         if let Some(kinds) = args.has_signals.as_deref().filter(|k| !k.is_empty()) {
             let kinds = match parse_kinds(kinds) {
@@ -1042,8 +1064,8 @@ impl ServerHandler for CrmServer {
             ))
             .with_instructions(format!(
                 "CRM for outbound prospecting ({name}). Companies are gathered from public \
-                 sources — SEC EDGAR, Wikidata, company websites, public job boards and trade \
-                 press — classified into industry verticals ({verticals}) and scored against \
+                 sources — investor portfolios (Y Combinator and other VCs), company websites, \
+                 public job boards, trade press, Wikidata and optionally SEC EDGAR — classified into industry verticals ({verticals}) and scored against \
                  customer profiles ({profiles}). Only companies are tracked, never individual \
                  people.\n\n\
                  A typical loop: `find_prospects` with a profile to get ranked companies with \
@@ -1051,7 +1073,8 @@ impl ServerHandler for CrmServer {
                  outreach; after reaching out, `log_activity` (which moves the account to \
                  contacted); record decisions with `update_account` (next step, nurture date, \
                  disqualify with a reason). `search_signals` finds timely triggers such as new \
-                 job postings or funding; `search_companies` filters by anything. If a company \
+                 job postings or a company newly added to an investor's portfolio; \
+                 `search_companies` filters by anything, including investor and cohort. If a company \
                  you need is missing, `add_company` with its domain. Call `describe_market` \
                  first to see what is indexed.",
                 name = m.name,
@@ -1087,6 +1110,24 @@ impl CrmServer {
                         m.suggest_verticals(n, 3).join(", ")
                     )
                 })
+            })
+            .collect()
+    }
+
+    /// Investor names, accepting a portfolio slug for its investor.
+    fn investors(&self, names: &[String]) -> Vec<String> {
+        names
+            .iter()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .map(|n| {
+                self.state
+                    .market
+                    .portfolios
+                    .iter()
+                    .find(|p| p.slug == n || p.investor.eq_ignore_ascii_case(n))
+                    .map(|p| p.investor.clone())
+                    .unwrap_or_else(|| n.to_string())
             })
             .collect()
     }
@@ -1177,6 +1218,7 @@ impl CrmServer {
 /// and its size range (or unknown). Soft preferences live in the score.
 fn apply_profile(f: &mut Filter, p: &crm_core::market::Profile) {
     f.any_of("verticals", &p.verticals);
+    f.any_of("investors", &p.investors);
     let countries: Vec<String> = p.countries.iter().map(|c| c.to_uppercase()).collect();
     f.any_of_or_missing("hq_country", &countries);
     f.any_of_or_missing("hq_state", &p.states);

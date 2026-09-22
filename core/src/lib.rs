@@ -13,6 +13,6 @@ pub mod model;
 pub mod request;
 
 pub use error::{Error, Result};
-pub use market::{MarketConfig, Profile, Vertical};
+pub use market::{MarketConfig, Portfolio, PortfolioKind, Profile, Vertical};
 pub use model::{Account, AccountStatus, Activity, ActivityType, Company, Doc, Signal, SignalKind};
 pub use request::{CompanyRequest, RequestStatus};

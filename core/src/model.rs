@@ -101,6 +101,16 @@ pub struct Company {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tech: Vec<String>,
 
+    /// Investors whose portfolios list this company.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub investors: Vec<String>,
+    /// Accelerator cohort, e.g. YC's "Summer 2025".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort: Option<String>,
+    /// Funding stage where a source reports one: "Early", "Growth".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+
     /// Every source that has contributed to this record.
     #[serde(default)]
     pub sources: Vec<String>,
@@ -125,7 +135,7 @@ pub struct Company {
 pub fn name_rank(source: &str) -> u8 {
     match source {
         "crawl" => 4,
-        "wikidata" => 3,
+        "wikidata" | "portfolios" => 3,
         "requests" => 2,
         "jobs" => 1,
         _ => 0,
@@ -209,6 +219,9 @@ impl Company {
             self.ats_slug = other.ats_slug.clone();
         }
         union(&mut self.tech, &other.tech);
+        union(&mut self.investors, &other.investors);
+        take(&mut self.cohort, &other.cohort);
+        take(&mut self.stage, &other.stage);
         union(&mut self.aliases, &other.aliases);
         union(&mut self.sources, &other.sources);
         self.last_signal_at = match (self.last_signal_at, other.last_signal_at) {

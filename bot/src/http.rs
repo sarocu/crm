@@ -131,17 +131,35 @@ impl Fetcher {
 
     /// Fetch a body as text, refusing anything oversized or non-textual.
     pub async fn get_text(&self, url: &str) -> Result<String> {
+        self.get_text_limited(url, MAX_BODY_BYTES).await
+    }
+
+    /// `get_text` with a caller-chosen size cap, for the few known-large
+    /// documents (the YC directory is ~10 MB of JSON).
+    pub async fn get_text_limited(&self, url: &str, max: usize) -> Result<String> {
+        Ok(self.get_page_limited(url, max).await?.1)
+    }
+
+    /// Fetch a page and the URL it finally came from after redirects.
+    /// Relative links must be resolved against that one: `/portfolio/`
+    /// redirecting to `/portfolio` changes what `./acme` means.
+    pub async fn get_page(&self, url: &str) -> Result<(String, String)> {
+        self.get_page_limited(url, MAX_BODY_BYTES).await
+    }
+
+    async fn get_page_limited(&self, url: &str, max: usize) -> Result<(String, String)> {
         let res = self.get(url).await?;
+        let final_url = res.url().to_string();
         if let Some(len) = res.content_length()
-            && len as usize > MAX_BODY_BYTES
+            && len as usize > max
         {
-            bail!("GET {url} body is {len} bytes, over the {MAX_BODY_BYTES} limit");
+            bail!("GET {url} body is {len} bytes, over the {max} limit");
         }
         let bytes = res.bytes().await.context("reading the response body")?;
-        if bytes.len() > MAX_BODY_BYTES {
-            bail!("GET {url} body exceeded the {MAX_BODY_BYTES} limit");
+        if bytes.len() > max {
+            bail!("GET {url} body exceeded the {max} limit");
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok((final_url, String::from_utf8_lossy(&bytes).into_owned()))
     }
 
     /// Is this URL crawlable according to the host's robots.txt?

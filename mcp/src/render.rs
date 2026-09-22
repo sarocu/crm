@@ -62,6 +62,12 @@ pub fn company_entry(
     if let Some(t) = &c.ticker {
         facts.push(format!("ticker {t}"));
     }
+    if !c.investors.is_empty() {
+        facts.push(format!("backed by {}", c.investors.join(", ")));
+    }
+    if let Some(b) = &c.cohort {
+        facts.push(b.clone());
+    }
     if let Some(ts) = c.last_signal_at {
         facts.push(format!("last signal {}", fmt_ts(ts)));
     }
@@ -191,6 +197,16 @@ pub fn dossier(
     if !c.industries.is_empty() {
         out.push_str(&format!("Industries: {}\n", c.industries.join(", ")));
     }
+    if !c.investors.is_empty() {
+        out.push_str(&format!("Investors: {}\n", c.investors.join(", ")));
+    }
+    if c.cohort.is_some() || c.stage.is_some() {
+        let bits: Vec<&str> = [c.cohort.as_deref(), c.stage.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        out.push_str(&format!("Cohort/stage: {}\n", bits.join(" · ")));
+    }
     if !c.tech.is_empty() {
         out.push_str(&format!("Seen on their site: {}\n", c.tech.join(", ")));
     }
@@ -292,6 +308,9 @@ pub fn profile(p: &Profile) -> String {
             p.signals.recency_days
         ));
     }
+    if !p.investors.is_empty() {
+        out.push_str(&format!("   backed by: {}\n", p.investors.join(", ")));
+    }
     if !p.keywords.is_empty() {
         out.push_str(&format!("   keywords: {}\n", p.keywords.join(", ")));
     }
@@ -339,6 +358,19 @@ pub fn market(v: &Value, m: &MarketConfig) -> String {
             vert.name,
             n.map(|x| x.to_string()).unwrap_or("?".into())
         ));
+    }
+    if let Some(pf) = v["portfolios"].as_array()
+        && !pf.is_empty()
+    {
+        out.push_str("\nPortfolios swept:\n");
+        for p in pf {
+            out.push_str(&format!(
+                "  {} — {} ({} companies)\n",
+                p["slug"].as_str().unwrap_or_default(),
+                p["investor"].as_str().unwrap_or_default(),
+                p["companies"].as_u64().unwrap_or(0)
+            ));
+        }
     }
     out.push_str("\nProfiles:\n");
     for p in &m.profiles {

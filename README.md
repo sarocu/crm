@@ -1,9 +1,10 @@
 # crm
 
 A prospecting CRM whose main interface is MCP, built for a BDR agent to
-use. The indexer collects companies in the industries you sell into, along
-with the signals that say they may be ready to buy: open roles, funding,
-launches, leadership changes, filings and press. The agent asks it who to
+use. The indexer collects companies from investor portfolios (Y Combinator
+and any VC you list) and the industries you sell into, along with the
+signals that say they may be ready to buy: a new investment, open roles,
+launches, leadership changes and press. The agent asks it who to
 work next and why. It then records what it did, so the next conversation
 starts where this one left off.
 
@@ -18,7 +19,8 @@ It tracks **companies only**, never individual people.
 | `core/` | the shared schema every binary depends on (not a service) | — |
 
 Everything market-specific lives in one TOML file: the **industry verticals**
-you sell into and the **customer profiles** you score against.
+you sell into, the **investor portfolios** to sweep, and the **customer
+profiles** you score against.
 `market.example.toml` is a worked example. See
 [Configuring the market](#configuring-the-market).
 
@@ -59,7 +61,7 @@ claude mcp add --transport http crm http://localhost:8080/mcp \
 | `find_prospects` | The starting point. Ranks companies by fit to a profile (0–100) and gives the reasons for each score. Leaves out accounts already being worked. |
 | `get_company` | The full dossier: firmographics, tech seen on their site, job board, account state, fit to every profile, latest signals and the activity log. |
 | `search_signals` | Buying signals, newest first, filtered by kind, date, vertical, company and hiring role. |
-| `search_companies` | Filter by text, vertical, profile, territory, headcount, tech, recent signals and pipeline status. |
+| `search_companies` | Filter by text, vertical, profile, investor, cohort, territory, headcount, tech, recent signals and pipeline status. |
 
 **Write**
 
@@ -83,6 +85,7 @@ meeting → qualified`, plus `disqualified` (requires a reason) and `nurture`
 `find_prospects` applies a profile's **hard filters** in Meilisearch:
 
 - The company is in one of the profile's verticals.
+- It is backed by one of the profile's `investors`, if the profile lists any.
 - Its HQ is in the territory, or unknown.
 - Its headcount is in range, or unknown.
 
@@ -131,9 +134,80 @@ countries = ["US"]                     # hard filter; unknown HQ passes
 states = ["CO", "UT"]                  # hard filter; unknown HQ passes
 employees = { min = 50, max = 1000 }   # hard filter; unknown size passes
 keywords = ["netsuite", "inventory"]   # scored
+investors = ["Y Combinator"]           # optional hard filter
 signals = { hiring_roles = ["operations", "supply chain"], recency_days = 90 }
 weights = { vertical = 3, size = 2, geo = 1, hiring = 3, news = 1, keywords = 2 }
 ```
+
+### Investor portfolios
+
+Being newly backed is one of the earliest buying signals there is, and a
+portfolio is a curated list of companies at a known stage. Every company a
+portfolio lists is tagged with the investor, and companies backed by several
+investors merge into one record with all of them.
+
+```toml
+[[portfolios]]                         # the YC directory, as JSON
+slug = "yc"
+investor = "Y Combinator"
+kind = "yc"
+url = "https://yc-oss.github.io/api/companies/all.json"
+statuses = ["Active", "Public"]        # default
+since_year = 2018                      # skip older batches
+
+[[portfolios]]                         # a page that links straight to companies
+slug = "usv"
+investor = "Union Square Ventures"
+kind = "page"
+url = "https://www.usv.com/companies"
+# selector = ".portfolio a"            # optional: only links inside this
+
+[[portfolios]]                         # a grid of the VC's own per-company pages
+slug = "sequoia"
+investor = "Sequoia Capital"
+kind = "page"
+url = "https://www.sequoiacap.com/our-companies/"
+detail_selector = "a[href*='companies/']"
+
+[[portfolios]]                         # a portfolio published as JSON
+slug = "example"
+investor = "Example Ventures"
+kind = "json"
+url = "https://example.vc/api/portfolio.json"
+items = "/data/companies"              # JSON pointers
+name_field = "/name"
+website_field = "/url"
+```
+
+The kinds:
+
+- **`yc`** reads the YC company directory. The default URL is
+  [yc-oss](https://github.com/yc-oss/api), a community mirror of YC's public
+  directory refreshed daily; it is not an official YC API. It brings team
+  size, location, industry tags, batch and stage. Every batch that started in the last year
+  becomes a funding signal.
+- **`page`** takes every outbound link on the page to another domain as a
+  portfolio company. Social, press and hosting domains are skipped. It works
+  on any VC whose portfolio page is plain HTML. With `detail_selector`, the
+  VC's own per-company pages are visited instead, a slice per run, for each
+  company's link. The crawler then fills in the rest from the company's own
+  site.
+- **`json`** is for portfolio sites that load their grid from a JSON file.
+
+The first complete sweep of a portfolio sets the baseline. After that,
+**a company that newly appears in the portfolio becomes a `funding` signal**
+("Added to the Sequoia Capital portfolio").
+
+A portfolio page that renders its grid with JavaScript yields no links. With
+`detail_selector` set, that is reported as an error rather than read as an
+empty portfolio. Look for a static page or the JSON the grid loads, and use
+`kind = "json"`. From a quick survey:
+
+| portfolio | works as |
+|---|---|
+| USV, Boldstart | `page` |
+| Sequoia, Accel, First Round | `page` with `detail_selector` |
+| Founders Fund | none: its page renders with JavaScript |
 
 Validation at startup rejects:
 
@@ -182,7 +256,8 @@ surviving record.
 | source | what it does | default interval |
 |---|---|---|
 | `requests` | Turns `add_company` requests into stubs and queues each homepage for crawling. | 1 min |
-| `edgar` | Walks the SEC ticker list and reads each company's submissions record. Keeps companies whose SIC code is in a vertical. Recent 8-Ks, 10-Ks, S-1s and Form Ds become signals; 8-K item 5.02 is a leadership change, 2.01 an acquisition. | 30 min |
+| `portfolios` | Reads the configured investor portfolios, a few per run, and emits funding signals for new batches and newly added companies. See [Investor portfolios](#investor-portfolios). | 30 min |
+| `edgar` | **Off by default**: public companies are rarely a BDR's target. Walks the SEC ticker list and reads each company's submissions record. Keeps companies whose SIC code is in a vertical. Recent 8-Ks, 10-Ks, S-1s and Form Ds become signals; 8-K item 5.02 is a leadership change, 2.01 an acquisition. | 30 min |
 | `wikidata` | Runs one SPARQL query per vertical QID for companies with an official website. Adds headcount, HQ, founding year and CIK. | 20 min |
 | `crawl` | Crawls known companies' homepages and follows only about, careers, news and product links. Reads schema.org `Organization` data, finds the company's Greenhouse, Lever or Ashby job board, notes tech keywords, and turns dated press releases into signals. | 10 min |
 | `jobs` | Polls the public job-board API of every company with a known board. Each open posting becomes a `hiring` signal tagged with role families. | 15 min |
@@ -227,7 +302,8 @@ balancer in front of it owns access. It shows:
 | `CRAWL_SEEDS` | bot | extra homepages to crawl |
 | `NEWS_FEEDS` | bot | extra feeds on top of the per-vertical ones |
 | `SOURCE_INTERVALS` | bot | `edgar=1h,crawl=10m,...` |
-| `DISABLED_SOURCES` | bot | `edgar,wikidata` |
+| `DISABLED_SOURCES` | bot | default `edgar`; set it empty to run every source |
+| `PORTFOLIOS_PER_RUN`, `PORTFOLIO_DETAIL_PER_RUN` | bot | defaults 3 / 60 |
 | `CRAWL_MAX_DEPTH`, `CRAWL_PAGES_PER_RUN`, `CRAWL_COMPANIES_PER_RUN` | bot | defaults 2 / 40 / 100 |
 | `EDGAR_PER_RUN`, `EDGAR_FILING_DAYS` | bot | defaults 200 / 180 |
 | `WIKIDATA_PAGE_SIZE`, `JOBS_PER_RUN` | bot | defaults 200 / 25 |

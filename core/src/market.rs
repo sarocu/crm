@@ -148,6 +148,63 @@ pub struct Profile {
     pub signals: SignalCriteria,
     #[serde(default)]
     pub weights: Weights,
+    /// Investor names ("Y Combinator"). When set, only companies backed by
+    /// one of them are prospects.
+    #[serde(default)]
+    pub investors: Vec<String>,
+}
+
+/// How a portfolio is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortfolioKind {
+    /// The Y Combinator company directory as JSON (the yc-oss mirror by
+    /// default): structured, with team size, location, batch and status.
+    Yc,
+    /// Any investor's portfolio web page. Every outbound link to another
+    /// domain is taken as a portfolio company, and the crawler fills in
+    /// the rest from that company's own site.
+    Page,
+    /// A JSON document listing the portfolio — many portfolio sites load
+    /// their grid from one. Fields are picked out with JSON pointers.
+    Json,
+}
+
+/// An investor whose portfolio companies are swept in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Portfolio {
+    pub slug: String,
+    /// The investor's name, recorded on every company it brings in.
+    pub investor: String,
+    pub kind: PortfolioKind,
+    pub url: String,
+    /// `page` only: a CSS selector scoping which links count, e.g.
+    /// `.portfolio-grid a`. Without it every outbound link on the page does.
+    #[serde(default)]
+    pub selector: Option<String>,
+    /// `page` only: when the grid links to the investor's own page per
+    /// company rather than to the company, a CSS selector for those links.
+    /// Each detail page is then visited for the company's outbound link.
+    #[serde(default)]
+    pub detail_selector: Option<String>,
+    /// `json` only: JSON pointer to the array of companies. Default: the
+    /// document root.
+    #[serde(default)]
+    pub items: Option<String>,
+    /// `json` only: pointer, within one item, to the company name.
+    /// Default `/name`.
+    #[serde(default)]
+    pub name_field: Option<String>,
+    /// `json` only: pointer, within one item, to the website. Default
+    /// `/website`.
+    #[serde(default)]
+    pub website_field: Option<String>,
+    /// `yc` only: which company statuses to keep. Default Active and Public.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// `yc` only: skip batches before this year.
+    #[serde(default)]
+    pub since_year: Option<i32>,
 }
 
 /// Language-dependent search settings, applied to every searchable index.
@@ -232,6 +289,9 @@ pub struct MarketConfig {
     pub verticals: Vec<Vertical>,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// Investors whose portfolios are swept for companies.
+    #[serde(default)]
+    pub portfolios: Vec<Portfolio>,
     #[serde(default)]
     pub vocabulary: Vocabulary,
 }
@@ -258,6 +318,38 @@ impl MarketConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        let mut seen_pf = std::collections::HashSet::new();
+        for p in &self.portfolios {
+            if !is_slug(&p.slug) || !seen_pf.insert(p.slug.as_str()) {
+                return Err(Error::Market(format!(
+                    "portfolio slug {:?} must be unique lowercase letters, digits and dashes",
+                    p.slug
+                )));
+            }
+            for sel in [&p.selector, &p.detail_selector].into_iter().flatten() {
+                if sel.trim().is_empty() {
+                    return Err(Error::Market(format!(
+                        "portfolio {:?} has an empty selector",
+                        p.slug
+                    )));
+                }
+            }
+            if p.investor.trim().is_empty() {
+                return Err(Error::Market(format!(
+                    "portfolio {:?} names no investor",
+                    p.slug
+                )));
+            }
+            let ok = url::Url::parse(&p.url)
+                .map(|u| matches!(u.scheme(), "http" | "https"))
+                .unwrap_or(false);
+            if !ok {
+                return Err(Error::Market(format!(
+                    "portfolio {:?} url {:?} is not an http(s) URL",
+                    p.slug, p.url
+                )));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for v in &self.verticals {
             if !is_slug(&v.slug) {
@@ -519,6 +611,7 @@ pub(crate) mod tests {
         let m = example();
         assert!(m.verticals.len() >= 3);
         assert!(m.profiles.len() >= 2);
+        assert!(m.portfolios.iter().any(|p| p.kind == PortfolioKind::Yc));
         for p in &m.profiles {
             for v in &p.verticals {
                 assert!(m.vertical(v).is_some());
@@ -597,6 +690,17 @@ pub(crate) mod tests {
             name = "B"
         "#;
         assert!(MarketConfig::parse(dup).is_err());
+
+        let bad_portfolio = r#"
+            name = "x"
+            slug = "x"
+            [[portfolios]]
+            slug = "yc"
+            investor = "Y Combinator"
+            kind = "yc"
+            url = "ftp://nope"
+        "#;
+        assert!(MarketConfig::parse(bad_portfolio).is_err());
 
         let bad_feed = r#"
             name = "x"

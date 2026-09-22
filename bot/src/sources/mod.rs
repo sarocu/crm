@@ -8,6 +8,7 @@ pub mod crawl;
 pub mod edgar;
 pub mod jobs;
 pub mod news;
+pub mod portfolios;
 pub mod requests;
 pub mod wikidata;
 
@@ -82,6 +83,7 @@ pub fn all() -> Vec<Box<dyn Source>> {
         // Requests first: a company the agent just asked for should show up
         // quickly, and the batch is tiny compared with a sweep.
         Box::new(requests::Requests),
+        Box::new(portfolios::Portfolios),
         Box::new(edgar::Edgar::default()),
         Box::new(wikidata::Wikidata),
         Box::new(crawl::Crawl),

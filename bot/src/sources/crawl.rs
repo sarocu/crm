@@ -224,8 +224,8 @@ impl Crawl {
             tracing::debug!(url = %entry.url, "robots.txt disallows this page");
             return Ok(Vec::new());
         }
-        let html = ctx.http.get_text(&entry.url).await?;
-        let base = Url::parse(&entry.url)?;
+        let (final_url, html) = ctx.http.get_page(&entry.url).await?;
+        let base = Url::parse(&final_url)?;
         let page = read_page(&html, &base);
 
         if entry.depth < ctx.config.crawl_max_depth {

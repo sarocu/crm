@@ -33,6 +33,10 @@ pub struct Config {
     pub wikidata_page_size: usize,
     /// Companies whose job boards are polled per run.
     pub jobs_per_run: usize,
+    /// Investor portfolios read per run.
+    pub portfolios_per_run: usize,
+    /// Investor detail pages visited per portfolio per run.
+    pub portfolio_detail_per_run: usize,
 }
 
 impl Config {
@@ -71,7 +75,7 @@ impl Config {
         );
 
         let intervals = parse_intervals(std::env::var("SOURCE_INTERVALS").ok().as_deref())?;
-        let disabled_sources = split_csv(std::env::var("DISABLED_SOURCES").ok().as_deref());
+        let disabled_sources = disabled(std::env::var("DISABLED_SOURCES").ok().as_deref());
 
         Ok(Self {
             bind,
@@ -94,6 +98,8 @@ impl Config {
                 .unwrap_or_else(|_| "https://query.wikidata.org/sparql".into()),
             wikidata_page_size: env_num("WIKIDATA_PAGE_SIZE", 200)?,
             jobs_per_run: env_num("JOBS_PER_RUN", 25)?,
+            portfolios_per_run: env_num("PORTFOLIOS_PER_RUN", 3)?,
+            portfolio_detail_per_run: env_num("PORTFOLIO_DETAIL_PER_RUN", 60)?,
         })
     }
 
@@ -126,6 +132,18 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Sources that stay off unless named in `DISABLED_SOURCES` (which then
+/// replaces this list). EDGAR only covers public companies, which are rarely
+/// who a BDR is after; portfolios are the better early signal.
+const OFF_BY_DEFAULT: &[&str] = &["edgar"];
+
+fn disabled(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        Some(r) => split_csv(Some(r)),
+        None => OFF_BY_DEFAULT.iter().map(|s| s.to_string()).collect(),
+    }
 }
 
 /// Parse `edgar=6h,wikidata=1d,crawl=15m`.
@@ -197,6 +215,16 @@ mod tests {
         assert_eq!(m["edgar"], Duration::from_secs(21600));
         assert_eq!(m["crawl"], Duration::from_secs(900));
         assert!(parse_intervals(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn edgar_is_off_unless_disabled_sources_says_otherwise() {
+        assert_eq!(disabled(None), vec!["edgar"]);
+        assert!(
+            disabled(Some("")).is_empty(),
+            "an empty value turns everything on"
+        );
+        assert_eq!(disabled(Some("news")), vec!["news"]);
     }
 
     #[test]
