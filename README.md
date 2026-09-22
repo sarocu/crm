@@ -62,6 +62,7 @@ claude mcp add --transport http crm http://localhost:8080/mcp \
 | `get_company` | The full dossier: firmographics, tech seen on their site, job board, account state, fit to every profile, latest signals and the activity log. |
 | `search_signals` | Buying signals, newest first, filtered by kind, date, vertical, company and hiring role. |
 | `search_companies` | Filter by text, vertical, profile, investor, cohort, territory, headcount, tech, recent signals and pipeline status. |
+| `list_portfolios` | Every investor portfolio swept, how many companies each has contributed, and how its last read went. |
 
 **Write**
 
@@ -70,6 +71,8 @@ claude mcp add --transport http crm http://localhost:8080/mcp \
 | `log_activity` | Records an email, call, LinkedIn message, meeting or note. Moves the account forward when the touch implies it: outbound → `contacted`, an inbound reply → `engaged`, a meeting → `meeting`. |
 | `update_account` | Sets status, owner, next step and date, tags and fit profile. Disqualifying requires a reason. Every status change is written to the activity log. |
 | `add_company` | Queues a company by domain. The indexer stubs it within a minute or two and crawls its site on the next pass. |
+| `add_portfolio` | Adds a VC's portfolio to the sweep at runtime, with no redeploy. Takes the investor's name and portfolio URL. Calling it again with the same slug updates it. |
+| `remove_portfolio` | Stops sweeping a portfolio added at runtime. Companies it brought in keep their investor tag. |
 
 Wherever a tool takes a company, it accepts an id, a domain or an exact name.
 Vertical and profile arguments accept a slug, a name or an alias, with typo
@@ -193,6 +196,27 @@ The kinds:
   company's link. The crawler then fills in the rest from the company's own
   site.
 - **`json`** is for portfolio sites that load their grid from a JSON file.
+
+#### Adding portfolios at runtime
+
+Portfolios in `market.toml` ship with the deployment. The agent can add
+more at any time with `add_portfolio`:
+
+```text
+add_portfolio investor="Denver Ventures" url="https://denverventures.co/portfolio/"
+```
+
+The indexer picks the new portfolio up on its next `portfolios` run, within
+about 30 minutes, and reads never-swept portfolios ahead of the rotation.
+`list_portfolios` and the dashboard's **Portfolios** page then show:
+
+- how many companies it yielded
+- whether its baseline is complete
+- any problem, such as a page that rendered no links
+
+Runtime portfolios live in the `portfolios` index. `remove_portfolio`
+disables one rather than deleting it, so the record of who added what
+survives. Portfolios configured in `market.toml` can only be changed there.
 
 The first complete sweep of a portfolio sets the baseline. After that,
 **a company that newly appears in the portfolio becomes a `funding` signal**
@@ -328,8 +352,12 @@ two keys. `make mcp-keys` (`deploy/create-mcp-keys.sh`) mints both:
 
 | key | actions | indexes |
 |---|---|---|
-| `crm-mcp-read` | `search`, `documents.get` | all five |
-| `crm-mcp-write` | `documents.add`, `tasks.get` | `accounts`, `activities`, `company_requests` |
+| `crm-mcp-read` | `search`, `documents.get` | `companies`, `signals`, `accounts`, `activities`, `company_requests`, `portfolios`, `bot_state` |
+| `crm-mcp-write` | `documents.add`, `tasks.get` | `accounts`, `activities`, `company_requests`, `portfolios` |
+
+Meilisearch cannot change a key's scope after it is created. If an existing
+key's scope is out of date, the script deletes it and mints a replacement;
+redeploy the MCP service with the new values afterwards.
 
 Neither key can delete documents, change settings or manage keys. A leaked
 agent token cannot touch the market data. In local development both keys fall

@@ -10,9 +10,11 @@ pub mod index;
 pub mod market;
 pub mod meili;
 pub mod model;
+pub mod portfolio;
 pub mod request;
 
 pub use error::{Error, Result};
 pub use market::{MarketConfig, Portfolio, PortfolioKind, Profile, Vertical};
 pub use model::{Account, AccountStatus, Activity, ActivityType, Company, Doc, Signal, SignalKind};
+pub use portfolio::{PortfolioStatus, RuntimePortfolio};
 pub use request::{CompanyRequest, RequestStatus};

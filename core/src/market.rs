@@ -207,6 +207,56 @@ pub struct Portfolio {
     pub since_year: Option<i32>,
 }
 
+impl Portfolio {
+    /// Everything that can be checked without fetching the page. Shared by
+    /// config loading and the MCP `add_portfolio` tool.
+    pub fn check(&self) -> std::result::Result<(), String> {
+        if !is_slug(&self.slug) {
+            return Err(format!(
+                "portfolio slug {:?} must be lowercase letters, digits and dashes",
+                self.slug
+            ));
+        }
+        if self.investor.trim().is_empty() {
+            return Err(format!("portfolio {:?} names no investor", self.slug));
+        }
+        let ok = url::Url::parse(&self.url)
+            .map(|u| matches!(u.scheme(), "http" | "https"))
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!(
+                "portfolio {:?} url {:?} is not an http(s) URL",
+                self.slug, self.url
+            ));
+        }
+        for sel in [&self.selector, &self.detail_selector]
+            .into_iter()
+            .flatten()
+        {
+            if sel.trim().is_empty() {
+                return Err(format!("portfolio {:?} has an empty selector", self.slug));
+            }
+        }
+        for ptr in [&self.items, &self.name_field, &self.website_field]
+            .into_iter()
+            .flatten()
+        {
+            if !ptr.is_empty() && !ptr.starts_with('/') {
+                return Err(format!(
+                    "portfolio {:?}: {ptr:?} is not a JSON pointer; they start with '/'",
+                    self.slug
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A slug from a name: "Denver Ventures" → "denver-ventures".
+pub fn slugify(name: &str) -> String {
+    normalize(name).replace(' ', "-")
+}
+
 /// Language-dependent search settings, applied to every searchable index.
 /// A value given here **replaces** the built-in default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,35 +370,10 @@ impl MarketConfig {
     fn validate(&self) -> Result<()> {
         let mut seen_pf = std::collections::HashSet::new();
         for p in &self.portfolios {
-            if !is_slug(&p.slug) || !seen_pf.insert(p.slug.as_str()) {
-                return Err(Error::Market(format!(
-                    "portfolio slug {:?} must be unique lowercase letters, digits and dashes",
-                    p.slug
-                )));
+            if !seen_pf.insert(p.slug.as_str()) {
+                return Err(Error::Market(format!("duplicate portfolio {:?}", p.slug)));
             }
-            for sel in [&p.selector, &p.detail_selector].into_iter().flatten() {
-                if sel.trim().is_empty() {
-                    return Err(Error::Market(format!(
-                        "portfolio {:?} has an empty selector",
-                        p.slug
-                    )));
-                }
-            }
-            if p.investor.trim().is_empty() {
-                return Err(Error::Market(format!(
-                    "portfolio {:?} names no investor",
-                    p.slug
-                )));
-            }
-            let ok = url::Url::parse(&p.url)
-                .map(|u| matches!(u.scheme(), "http" | "https"))
-                .unwrap_or(false);
-            if !ok {
-                return Err(Error::Market(format!(
-                    "portfolio {:?} url {:?} is not an http(s) URL",
-                    p.slug, p.url
-                )));
-            }
+            p.check().map_err(Error::Market)?;
         }
         let mut seen = std::collections::HashSet::new();
         for v in &self.verticals {
@@ -711,6 +736,16 @@ pub(crate) mod tests {
             feeds = ["not a url"]
         "#;
         assert!(MarketConfig::parse(bad_feed).is_err());
+    }
+
+    #[test]
+    fn portfolios_check_their_shape_and_names_slugify() {
+        let mut p = example().portfolios[0].clone();
+        assert!(p.check().is_ok());
+        p.items = Some("data".into());
+        assert!(p.check().unwrap_err().contains("JSON pointer"));
+        assert_eq!(slugify("Denver Ventures, LLC"), "denver-ventures-llc");
+        assert_eq!(slugify("Cañon Capital"), "canon-capital");
     }
 
     #[test]

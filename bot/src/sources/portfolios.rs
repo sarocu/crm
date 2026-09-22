@@ -25,9 +25,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use crm_core::id::{company_id, root_domain};
-use crm_core::index::COMPANIES;
+use crm_core::index::{COMPANIES, PORTFOLIOS};
 use crm_core::market::{Portfolio, PortfolioKind};
 use crm_core::model::{Company, Doc, Signal, SignalKind, collapse_ws, now_ts};
+use crm_core::portfolio::{PortfolioStatus, RuntimePortfolio};
+use meilisearch_sdk::search::SearchQuery;
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,6 +89,17 @@ const NOISE_DOMAINS: &[&str] = &[
     "webflow.io",
     "wixsite.com",
     "squarespace.com",
+    // Investor back-office links: LP portals, forms, data rooms.
+    "carta.com",
+    "hsforms.com",
+    "hs-sites.com",
+    "hubspotpagebuilder.com",
+    "docsend.com",
+    "airtable.com",
+    "jotform.com",
+    "formstack.com",
+    "junipersquare.com",
+    "angellist.com",
 ];
 
 /// Link texts that are calls to action, not company names.
@@ -139,55 +152,149 @@ impl Source for Portfolios {
     }
 
     async fn fetch(&self, ctx: &Ctx, cursor: Option<Value>) -> Result<Batch> {
-        let all = &ctx.market.portfolios;
+        let all = all_portfolios(ctx).await;
         if all.is_empty() {
-            tracing::debug!("no portfolios configured; the portfolios source has nothing to do");
+            tracing::debug!(
+                "no portfolios configured or added; the portfolios source has nothing to do"
+            );
             return Ok(Batch::empty());
         }
         let mut cur: Cursor = cursor
             .and_then(|c| serde_json::from_value(c).ok())
             .unwrap_or_default();
-        let per_run = ctx.config.portfolios_per_run.clamp(1, all.len());
-        let start = cur.pos % all.len();
+        let slugs: Vec<String> = all.iter().map(|p| p.slug.clone()).collect();
+        let read_before = ctx
+            .state
+            .portfolio_statuses(&slugs)
+            .await
+            .unwrap_or_default();
+        let (order, next_pos, wrapped) =
+            plan_run(&slugs, &read_before, cur.pos, ctx.config.portfolios_per_run);
 
         let mut docs = Vec::new();
-        let mut wrapped = false;
-        for i in 0..per_run {
-            let idx = (start + i) % all.len();
-            wrapped |= idx + 1 == all.len();
+        for idx in order {
             let pf = &all[idx];
-            let read = match self.read(ctx, pf, &mut cur).await {
-                Ok(r) => r,
+            let mut status = PortfolioStatus {
+                slug: pf.slug.clone(),
+                last_read_at: now_ts(),
+                ..Default::default()
+            };
+            match self.read(ctx, pf, &mut cur).await {
+                Ok(read) => {
+                    let first_sweep = !cur.swept.contains(&pf.slug);
+                    let mut added = Vec::new();
+                    if !first_sweep && pf.kind != PortfolioKind::Yc {
+                        added = newly_added(ctx, pf, &read.companies).await?;
+                    }
+                    tracing::info!(
+                        portfolio = %pf.slug,
+                        investor = %pf.investor,
+                        companies = read.companies.len(),
+                        newly_added = added.len(),
+                        baseline = first_sweep,
+                        "portfolio read"
+                    );
+                    if read.complete && first_sweep {
+                        cur.swept.push(pf.slug.clone());
+                    }
+                    status.companies = read.companies.len();
+                    status.newly_added = added.len();
+                    if read.companies.is_empty() {
+                        status.error = Some(
+                            "the page yielded no company links; it may render with JavaScript, \
+                             or need a selector"
+                                .into(),
+                        );
+                    }
+                    docs.extend(read.companies.into_iter().map(Doc::Company));
+                    docs.extend(read.signals.into_iter().map(Doc::Signal));
+                    docs.extend(added.into_iter().map(Doc::Signal));
+                }
                 Err(e) => {
                     // One broken portfolio page must not stall the others.
-                    tracing::warn!(portfolio = %pf.slug, error = %format!("{e:#}"), "portfolio read failed");
-                    continue;
+                    let msg = format!("{e:#}");
+                    tracing::warn!(portfolio = %pf.slug, error = %msg, "portfolio read failed");
+                    status.error = Some(msg.chars().take(500).collect());
                 }
-            };
-            let first_sweep = !cur.swept.contains(&pf.slug);
-            let mut added = Vec::new();
-            if !first_sweep && pf.kind != PortfolioKind::Yc {
-                added = newly_added(ctx, pf, &read.companies).await?;
             }
-            tracing::info!(
-                portfolio = %pf.slug,
-                investor = %pf.investor,
-                companies = read.companies.len(),
-                newly_added = added.len(),
-                baseline = first_sweep,
-                "portfolio read"
-            );
-            if read.complete && first_sweep {
-                cur.swept.push(pf.slug.clone());
+            status.baselined = cur.swept.contains(&pf.slug);
+            if let Err(e) = ctx.state.set_portfolio_status(&status).await {
+                tracing::warn!(portfolio = %pf.slug, error = %e, "could not record portfolio status");
             }
-            docs.extend(read.companies.into_iter().map(Doc::Company));
-            docs.extend(read.signals.into_iter().map(Doc::Signal));
-            docs.extend(added.into_iter().map(Doc::Signal));
         }
-        cur.pos = (start + per_run) % all.len();
+        cur.pos = next_pos;
         let batch = Batch::new(docs, Some(serde_json::to_value(&cur)?));
         Ok(if wrapped { batch.swept() } else { batch })
     }
+}
+
+/// The configured portfolios, then every enabled one added at runtime whose
+/// slug the config does not already use.
+async fn all_portfolios(ctx: &Ctx) -> Vec<Portfolio> {
+    let mut all = ctx.market.portfolios.clone();
+    match runtime_portfolios(ctx).await {
+        Ok(extra) => {
+            for p in extra {
+                if all.iter().any(|c| c.slug == p.slug) {
+                    tracing::warn!(slug = %p.slug, "a runtime portfolio reuses a configured slug; ignoring it");
+                } else {
+                    all.push(p);
+                }
+            }
+        }
+        // Keep sweeping the configured ones if the runtime list is unreadable.
+        Err(e) => tracing::warn!(error = %e, "could not read runtime portfolios"),
+    }
+    all
+}
+
+async fn runtime_portfolios(ctx: &Ctx) -> Result<Vec<Portfolio>> {
+    let idx = ctx.state.client().index(PORTFOLIOS);
+    let sort = ["added_at:asc"];
+    let mut q = SearchQuery::new(&idx);
+    q.with_query("")
+        .with_filter("enabled = true")
+        .with_sort(&sort)
+        .with_limit(1000);
+    Ok(q.execute::<RuntimePortfolio>()
+        .await?
+        .hits
+        .into_iter()
+        .map(|h| h.result.portfolio)
+        .collect())
+}
+
+/// Which portfolios to read this run, the next rotation position, and
+/// whether the rotation wrapped. Portfolios never read before go first, so
+/// one the agent just added is swept on the next run rather than whenever
+/// the rotation reaches it.
+pub fn plan_run(
+    slugs: &[String],
+    read_before: &HashSet<String>,
+    pos: usize,
+    per_run: usize,
+) -> (Vec<usize>, usize, bool) {
+    let n = slugs.len();
+    if n == 0 {
+        return (Vec::new(), 0, false);
+    }
+    let per_run = per_run.clamp(1, n);
+    let mut order: Vec<usize> = (0..n)
+        .filter(|i| !read_before.contains(&slugs[*i]))
+        .take(per_run)
+        .collect();
+    let start = pos % n;
+    let mut steps = 0;
+    let mut wrapped = false;
+    while order.len() < per_run && steps < n {
+        let idx = (start + steps) % n;
+        steps += 1;
+        wrapped |= idx + 1 == n;
+        if !order.contains(&idx) {
+            order.push(idx);
+        }
+    }
+    (order, (start + steps) % n, wrapped)
 }
 
 impl Portfolios {
@@ -551,12 +658,87 @@ impl Found {
     }
 }
 
+/// Words in logo file names and alt texts that are not part of the name.
+const FILLER: &[&str] = &[
+    "logo", "logos", "img", "image", "icon", "photo", "png", "jpg", "jpeg", "svg", "webp", "copy",
+    "final", "white", "black", "color", "colour", "dark", "light", "mark", "wordmark",
+];
+
+/// Design-tool export names: "Frame 111", "Group 42".
+const EXPORT_WORDS: &[&str] = &[
+    "frame",
+    "group",
+    "rectangle",
+    "layer",
+    "vector",
+    "image",
+    "artboard",
+];
+
+/// A company name from link text, an image's alt or a label — or `None`
+/// when what is there is a call to action or a file name rather than a
+/// name. Logos are often uploaded as `DV-Portfolio-Acme-Co.png` or with a
+/// hash for a name, and those alt texts must not become company names.
 fn clean_name(raw: &str) -> Option<String> {
-    let n = collapse_ws(raw);
+    let mut n = collapse_ws(raw);
+    // "DV-Portfolio-Caliber-Mind" → "Caliber Mind"; "acme_logo" → "acme".
+    let lower_raw = n.to_lowercase();
+    let file_like = !n.contains(' ')
+        || ["portfolio-", "portfolio_", "logo-", "logo_"]
+            .iter()
+            .any(|m| lower_raw.contains(m));
+    if file_like && (n.contains('-') || n.contains('_')) {
+        n = n
+            .split(['-', '_'])
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let mut words: Vec<&str> = n.split_whitespace().collect();
+    if let Some(i) = words
+        .iter()
+        .position(|w| w.eq_ignore_ascii_case("portfolio"))
+    {
+        words.drain(..=i);
+    }
+    words.retain(|w| !FILLER.contains(&w.to_lowercase().trim_matches('.')));
+    let n = words.join(" ");
+
     let lower = n.to_lowercase();
     let trimmed = lower.trim_matches(|c: char| !c.is_alphanumeric());
-    if n.chars().count() < 2 || n.chars().count() > 80 || GENERIC_TEXT.contains(&trimmed) {
+    let count = n.chars().count();
+    if !(2..=80).contains(&count) || GENERIC_TEXT.contains(&trimmed) {
         return None;
+    }
+    // Ids: long digit runs, hashes and UUIDs.
+    let longest_digits = n
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let hexish = n.len() >= 16 && n.chars().all(|c| c.is_ascii_hexdigit() || c == ' ');
+    if longest_digits >= 5 || hexish {
+        return None;
+    }
+    if words.len() == 2
+        && EXPORT_WORDS.contains(&words[0].to_lowercase().as_str())
+        && words[1].chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    // "peak energy" → "Peak Energy"; leave deliberate casing alone.
+    if n.chars().all(|c| !c.is_uppercase()) {
+        return Some(
+            n.split(' ')
+                .map(|w| {
+                    let mut c = w.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     Some(n)
 }
@@ -775,6 +957,32 @@ mod tests {
     }
 
     #[test]
+    fn unread_portfolios_jump_the_rotation() {
+        let slugs: Vec<String> = ["a", "b", "c", "d", "new"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let read: HashSet<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let (order, next, wrapped) = plan_run(&slugs, &read, 1, 3);
+        assert_eq!(
+            order,
+            vec![4, 1, 2],
+            "the unread one first, then the rotation"
+        );
+        assert_eq!(next, 3);
+        assert!(!wrapped);
+
+        let all: HashSet<String> = slugs.iter().cloned().collect();
+        let (order, next, wrapped) = plan_run(&slugs, &all, 4, 3);
+        assert_eq!(order, vec![4, 0, 1]);
+        assert_eq!(next, 2);
+        assert!(wrapped);
+
+        assert_eq!(plan_run(&slugs[..1], &all, 7, 3).0, vec![0]);
+        assert!(plan_run(&[], &all, 0, 3).0.is_empty());
+    }
+
+    #[test]
     fn batches_and_locations_parse() {
         assert!(batch_start("Fall 2024").unwrap() > batch_start("Summer 2024").unwrap());
         assert!(batch_start("IK12").is_none());
@@ -859,6 +1067,32 @@ mod tests {
         assert_eq!(cs[0].investors, vec!["Test Ventures"]);
         p.items = Some("/missing".into());
         assert!(json_companies(&doc, &p).is_err());
+    }
+
+    #[test]
+    fn logo_file_names_are_cleaned_or_rejected() {
+        assert_eq!(
+            clean_name("DV-Portfolio-Caliber-Mind").as_deref(),
+            Some("Caliber Mind")
+        );
+        assert_eq!(clean_name("DV-Portfolio-BOOM").as_deref(), Some("BOOM"));
+        assert_eq!(
+            clean_name("DV-Portfolio-Crop Diagnostix").as_deref(),
+            Some("Crop Diagnostix")
+        );
+        assert_eq!(clean_name("Coca-Cola").as_deref(), Some("Coca Cola"));
+        assert_eq!(
+            clean_name("Rolls-Royce Holdings").as_deref(),
+            Some("Rolls-Royce Holdings")
+        );
+        assert_eq!(clean_name("acme_logo_white").as_deref(), Some("Acme"));
+        assert_eq!(clean_name("peak energy").as_deref(), Some("Peak Energy"));
+        assert_eq!(clean_name("Eleven labs").as_deref(), Some("Eleven labs"));
+        assert_eq!(clean_name("22efa393-87a3-4632-830f-e6d89b6f2337"), None);
+        assert_eq!(clean_name("5321458703472988073"), None);
+        assert_eq!(clean_name("photo_5422780761553106618_y"), None);
+        assert_eq!(clean_name("Frame 111"), None);
+        assert_eq!(clean_name("Learn more"), None);
     }
 
     #[test]

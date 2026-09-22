@@ -225,6 +225,47 @@ pub struct LogActivityArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddPortfolioArgs {
+    /// The investor's name as it should be recorded on every company it
+    /// brings in: "Denver Ventures".
+    pub investor: String,
+    /// The page (or JSON document) listing the portfolio.
+    pub url: String,
+    /// "page" (default): take every outbound company link on the page.
+    /// "json": read a JSON list with `items`/`name_field`/`website_field`.
+    /// "yc": the Y Combinator directory format.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// page: CSS selector scoping which links count, e.g. ".portfolio a".
+    #[serde(default)]
+    pub selector: Option<String>,
+    /// page: CSS selector for links to the investor's own per-company pages,
+    /// when the grid links there instead of to the companies.
+    #[serde(default)]
+    pub detail_selector: Option<String>,
+    /// json: JSON pointer to the array of companies, e.g. "/data".
+    #[serde(default)]
+    pub items: Option<String>,
+    /// json: pointer within an item to the name. Default "/name".
+    #[serde(default)]
+    pub name_field: Option<String>,
+    /// json: pointer within an item to the website. Default "/website".
+    #[serde(default)]
+    pub website_field: Option<String>,
+    /// Short id; derived from the investor's name when omitted.
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RemovePortfolioArgs {
+    /// The portfolio's slug, from list_portfolios.
+    pub slug: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddCompanyArgs {
     /// The company's domain or website URL: "acme.com".
     pub domain: String,
@@ -309,7 +350,7 @@ impl CrmServer {
                 "name": p.name,
                 "description": p.description,
             })).collect::<Vec<_>>(),
-            "portfolios": m.portfolios.iter().map(|p| json!({
+            "portfolios": self.active_portfolios().await.iter().map(|p| json!({
                 "slug": p.slug,
                 "investor": p.investor,
                 "companies": by_investor.get(&p.investor).copied().unwrap_or(0),
@@ -410,7 +451,8 @@ impl CrmServer {
             f.any_of("tech", &lower);
         }
         if let Some(i) = &args.investors {
-            f.any_of("investors", &self.investors(i));
+            let known = self.active_portfolios().await;
+            f.any_of("investors", &investor_names(i, &known));
         }
         if let Some(c) = &args.cohorts {
             f.any_of("cohort", c);
@@ -975,6 +1017,214 @@ impl CrmServer {
     }
 
     #[tool(
+        name = "list_portfolios",
+        description = "List every investor portfolio the indexer sweeps — the ones configured at deploy time and the ones added with add_portfolio — with how many companies each has contributed and how its last read went (when, how many companies, any error). Check this after add_portfolio to see whether the page actually yielded companies."
+    )]
+    async fn list_portfolios(&self) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let runtime = match st.runtime_portfolios().await {
+            Ok(r) => r,
+            Err(e) => return Ok(backend_error("list_portfolios", e)),
+        };
+        let mut rows: Vec<(crm_core::market::Portfolio, &str, bool, Option<String>)> = st
+            .market
+            .portfolios
+            .iter()
+            .map(|p| (p.clone(), "config", true, None))
+            .collect();
+        for r in &runtime {
+            if !rows.iter().any(|(p, ..)| p.slug == r.portfolio.slug) {
+                rows.push((
+                    r.portfolio.clone(),
+                    "runtime",
+                    r.enabled,
+                    Some(r.added_by.clone()),
+                ));
+            }
+        }
+        let slugs: Vec<String> = rows.iter().map(|(p, ..)| p.slug.clone()).collect();
+        let statuses = st.portfolio_statuses(&slugs).await;
+        let counts = st
+            .facet(COMPANIES, "investors", LIVE)
+            .await
+            .unwrap_or_default();
+
+        let mut text = format!("{} portfolio(s)\n\n", rows.len());
+        let mut out = Vec::new();
+        for (p, origin, enabled, by) in &rows {
+            let n = counts.get(&p.investor).copied().unwrap_or(0);
+            let status = statuses.get(&p.slug);
+            text.push_str(&format!(
+                "{} — {} [{}{}] {} companies\n   {} ({:?})\n",
+                p.slug,
+                p.investor,
+                origin,
+                if *enabled { "" } else { ", removed" },
+                n,
+                p.url,
+                p.kind
+            ));
+            match status {
+                None if *enabled => text.push_str(
+                    "   not read yet — it goes first on the indexer's next portfolios run\n",
+                ),
+                None => {}
+                Some(s) => {
+                    text.push_str(&format!(
+                        "   last read {}: {} companies, {} newly added{}\n",
+                        render::fmt_ts(s.last_read_at),
+                        s.companies,
+                        s.newly_added,
+                        if s.baselined {
+                            ""
+                        } else {
+                            " (baseline not complete)"
+                        }
+                    ));
+                    if let Some(e) = &s.error {
+                        text.push_str(&format!("   problem: {e}\n"));
+                    }
+                }
+            }
+            out.push(json!({
+                "slug": p.slug,
+                "investor": p.investor,
+                "kind": p.kind,
+                "url": p.url,
+                "origin": origin,
+                "enabled": enabled,
+                "added_by": by,
+                "companies": n,
+                "last_read": status,
+            }));
+        }
+        Ok(respond(text, json!({ "portfolios": out })))
+    }
+
+    #[tool(
+        name = "add_portfolio",
+        description = "Add an investor's portfolio to the sweep at runtime, no redeploy needed: every company it lists is indexed and tagged with the investor, and once the baseline sweep is done, companies newly added to the portfolio become funding signals. Give the investor's name and the URL of their portfolio page. The indexer reads a newly added portfolio on its next run (within about 30 minutes); then call list_portfolios to check it yielded companies — pages that render with JavaScript yield none and need a `json` URL or `detail_selector` instead. Calling it again with the same slug updates the portfolio."
+    )]
+    async fn add_portfolio(
+        &self,
+        Parameters(args): Parameters<AddPortfolioArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use crm_core::market::{Portfolio, PortfolioKind, slugify};
+        let st = &self.state;
+        let actor = actor(&parts);
+        let kind = match args
+            .kind
+            .as_deref()
+            .map(|k| k.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("page") => PortfolioKind::Page,
+            Some("json") => PortfolioKind::Json,
+            Some("yc") => PortfolioKind::Yc,
+            Some(other) => {
+                return Ok(user_error(format!(
+                    "unknown kind {other:?}; use page, json or yc"
+                )));
+            }
+        };
+        let slug = args
+            .slug
+            .as_deref()
+            .map(slugify)
+            .unwrap_or_else(|| slugify(&args.investor));
+        if st.market.portfolios.iter().any(|p| p.slug == slug) {
+            return Ok(user_error(format!(
+                "{slug:?} is configured in market.toml; change it there, or pass a different `slug`"
+            )));
+        }
+        let blank = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let portfolio = Portfolio {
+            slug: slug.clone(),
+            investor: args.investor.trim().to_string(),
+            kind,
+            url: args.url.trim().to_string(),
+            selector: blank(args.selector),
+            detail_selector: blank(args.detail_selector),
+            items: blank(args.items),
+            name_field: blank(args.name_field),
+            website_field: blank(args.website_field),
+            statuses: Vec::new(),
+            since_year: None,
+        };
+        if let Err(e) = portfolio.check() {
+            return Ok(user_error(e));
+        }
+        let now = now_ts();
+        let existing = match st.runtime_portfolio(&slug).await {
+            Ok(e) => e,
+            Err(e) => return Ok(backend_error("add_portfolio", e)),
+        };
+        let record = crm_core::portfolio::RuntimePortfolio {
+            id: slug.clone(),
+            portfolio,
+            enabled: true,
+            added_by: existing
+                .as_ref()
+                .map(|e| e.added_by.clone())
+                .unwrap_or_else(|| actor.clone()),
+            added_at: existing.as_ref().map(|e| e.added_at).unwrap_or(now),
+            updated_at: now,
+            note: blank(args.note),
+        };
+        if let Err(e) = st.write_portfolio(&record).await {
+            return Ok(backend_error("add_portfolio", e));
+        }
+        let verb = if existing.is_some() {
+            "Updated"
+        } else {
+            "Added"
+        };
+        Ok(respond(
+            format!(
+                "{verb} portfolio {slug} ({}). The indexer reads it on its next portfolios run, ahead of the rotation; check list_portfolios afterwards to see how many companies it yielded.",
+                record.portfolio.investor
+            ),
+            json!({ "status": verb.to_lowercase(), "portfolio": record }),
+        ))
+    }
+
+    #[tool(
+        name = "remove_portfolio",
+        description = "Stop sweeping a portfolio added with add_portfolio. Companies it already brought in stay indexed and keep the investor tag. Portfolios configured in market.toml can only be removed there."
+    )]
+    async fn remove_portfolio(
+        &self,
+        Parameters(args): Parameters<RemovePortfolioArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let slug = args.slug.trim();
+        if st.market.portfolios.iter().any(|p| p.slug == slug) {
+            return Ok(user_error(format!(
+                "{slug:?} is configured in market.toml and can only be removed there"
+            )));
+        }
+        let mut record = match st.runtime_portfolio(slug).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Ok(user_error(format!(
+                    "no runtime portfolio {slug:?}; list_portfolios shows them all"
+                )));
+            }
+            Err(e) => return Ok(backend_error("remove_portfolio", e)),
+        };
+        record.enabled = false;
+        record.updated_at = now_ts();
+        if let Err(e) = st.write_portfolio(&record).await {
+            return Ok(backend_error("remove_portfolio", e));
+        }
+        Ok(respond(
+            format!("Stopped sweeping {slug} ({}).", record.portfolio.investor),
+            json!({ "status": "removed", "slug": slug }),
+        ))
+    }
+
+    #[tool(
         name = "add_company",
         description = "Ask the indexer to add a company by its domain. It is stubbed within a minute or two and its website crawled on the indexer's next crawl pass, after which get_company shows what was found. Returns the id the company will have. If the company is already indexed, says so and returns its id instead."
     )]
@@ -1074,7 +1324,8 @@ impl ServerHandler for CrmServer {
                  contacted); record decisions with `update_account` (next step, nurture date, \
                  disqualify with a reason). `search_signals` finds timely triggers such as new \
                  job postings or a company newly added to an investor's portfolio; \
-                 `search_companies` filters by anything, including investor and cohort. If a company \
+                 `search_companies` filters by anything, including investor and cohort. \
+                 To widen the net, `add_portfolio` adds a VC's portfolio to the sweep at runtime. If a company \
                  you need is missing, `add_company` with its domain. Call `describe_market` \
                  first to see what is indexed.",
                 name = m.name,
@@ -1114,22 +1365,17 @@ impl CrmServer {
             .collect()
     }
 
-    /// Investor names, accepting a portfolio slug for its investor.
-    fn investors(&self, names: &[String]) -> Vec<String> {
-        names
-            .iter()
-            .map(|n| n.trim())
-            .filter(|n| !n.is_empty())
-            .map(|n| {
-                self.state
-                    .market
-                    .portfolios
-                    .iter()
-                    .find(|p| p.slug == n || p.investor.eq_ignore_ascii_case(n))
-                    .map(|p| p.investor.clone())
-                    .unwrap_or_else(|| n.to_string())
-            })
-            .collect()
+    /// Configured portfolios plus enabled runtime ones.
+    async fn active_portfolios(&self) -> Vec<crm_core::market::Portfolio> {
+        let mut all = self.state.market.portfolios.clone();
+        if let Ok(rt) = self.state.runtime_portfolios().await {
+            for r in rt.into_iter().filter(|r| r.enabled) {
+                if !all.iter().any(|p| p.slug == r.portfolio.slug) {
+                    all.push(r.portfolio);
+                }
+            }
+        }
+        all
     }
 
     fn no_profile(&self, name: &str) -> String {
@@ -1238,6 +1484,22 @@ fn apply_profile(f: &mut Filter, p: &crm_core::market::Profile) {
             ));
         }
     }
+}
+
+/// Investor names, accepting a portfolio slug for its investor.
+fn investor_names(names: &[String], portfolios: &[crm_core::market::Portfolio]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+        .map(|n| {
+            portfolios
+                .iter()
+                .find(|p| p.slug == n || p.investor.eq_ignore_ascii_case(n))
+                .map(|p| p.investor.clone())
+                .unwrap_or_else(|| n.to_string())
+        })
+        .collect()
 }
 
 /// How an account moves when an activity is logged. Only ever forward, and

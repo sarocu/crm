@@ -27,6 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/accounts/{id}", get(account_detail))
         .route("/companies", get(companies))
         .route("/requests", get(requests))
+        .route("/portfolios", get(portfolios))
         .route("/healthz", get(crate::healthz))
         .with_state(state)
 }
@@ -37,6 +38,7 @@ fn nav(current: &'static str) -> Nav {
             ("/", "Overview"),
             ("/accounts", "Pipeline"),
             ("/companies", "Companies"),
+            ("/portfolios", "Portfolios"),
             ("/requests", "Requests"),
         ],
         current,
@@ -509,6 +511,73 @@ async fn requests(State(state): State<Arc<AppState>>) -> Markup {
                                 td {
                                     @if let Some(n) = &r.note { (n) }
                                     @if let Some(n) = &r.apply_note { div.small.muted { (n) } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+// ------------------------------------------------------------ portfolios
+
+async fn portfolios(State(state): State<Arc<AppState>>) -> Markup {
+    let rows = state.store.portfolios().await;
+    shell(
+        &state,
+        "Portfolios",
+        "Portfolios",
+        html! {
+            h1 { "Portfolios" }
+            p.lede {
+                "Investors whose portfolio companies the indexer sweeps. Config ones ship in market.toml; "
+                "runtime ones were added by the agent with add_portfolio."
+            }
+            @if rows.is_empty() {
+                .note { "No portfolios yet." }
+            } @else {
+                table {
+                    thead { tr {
+                        th { "Investor" } th { "Kind" } th { "Companies" } th.nowrap { "Last read" } th { "State" }
+                    } }
+                    tbody {
+                        @for r in &rows {
+                            tr {
+                                td {
+                                    a href={ "/companies?q=" (urlencode(&r.portfolio.investor)) } { (r.portfolio.investor) }
+                                    div.small.muted.mono { (r.portfolio.slug) }
+                                    div.small.muted { a href=(r.portfolio.url) rel="noopener noreferrer" { (truncate(&r.portfolio.url, 60)) } }
+                                }
+                                td {
+                                    (format!("{:?}", r.portfolio.kind).to_lowercase())
+                                    div.small.muted {
+                                        (r.origin)
+                                        @if let Some(by) = &r.added_by { " · added by " (by) }
+                                    }
+                                }
+                                td { (r.companies) }
+                                td.nowrap {
+                                    @match &r.status {
+                                        Some(s) => {
+                                            (views::ago(s.last_read_at))
+                                            div.small.muted { (s.companies) " found · " (s.newly_added) " new" }
+                                        }
+                                        None => { "not yet" }
+                                    }
+                                }
+                                td {
+                                    @if !r.enabled {
+                                        span."badge"."off" { "removed" }
+                                    } @else if let Some(e) = r.status.as_ref().and_then(|s| s.error.as_ref()) {
+                                        span."badge"."warn" { "problem" }
+                                        div.small.muted { (truncate(e, 140)) }
+                                    } @else if r.status.as_ref().is_some_and(|s| s.baselined) {
+                                        span."badge"."ok" { "watching" }
+                                    } @else {
+                                        span."badge"."info" { "baselining" }
+                                    }
                                 }
                             }
                         }

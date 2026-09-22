@@ -16,6 +16,7 @@ use crm_core::id::stable_id;
 use crm_core::index::BOT_STATE;
 use crm_core::meili::{self, Client};
 use crm_core::model::now_ts;
+use crm_core::portfolio::PortfolioStatus;
 use meilisearch_sdk::search::{SearchQuery, Selectors};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,28 @@ impl BotState {
         doc.value = value;
         meili::upsert_chunked(&self.client, BOT_STATE, &[doc]).await?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------- portfolios
+
+    /// Record how a portfolio's latest read went, for `list_portfolios`.
+    pub async fn set_portfolio_status(&self, status: &PortfolioStatus) -> Result<()> {
+        let mut doc = StateDoc::empty(PortfolioStatus::state_id(&status.slug), "portfolio_status");
+        doc.source = "portfolios".into();
+        doc.value = Some(serde_json::to_value(status)?);
+        meili::upsert_chunked(&self.client, BOT_STATE, &[doc]).await?;
+        Ok(())
+    }
+
+    /// Slugs of the portfolios that have been read at least once.
+    pub async fn portfolio_statuses(&self, slugs: &[String]) -> Result<HashSet<String>> {
+        let ids: Vec<String> = slugs.iter().map(|s| PortfolioStatus::state_id(s)).collect();
+        let rows: Vec<StateDoc> = fetch_by_ids(&self.client, BOT_STATE, &ids, None).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|d| serde_json::from_value::<PortfolioStatus>(d.value?).ok())
+            .map(|s| s.slug)
+            .collect())
     }
 
     // ------------------------------------------------------------ frontier

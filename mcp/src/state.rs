@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use crm_core::id::{company_id, root_domain};
-use crm_core::index::{ACCOUNTS, ACTIVITIES, COMPANIES, COMPANY_REQUESTS, SIGNALS};
+use crm_core::index::{
+    ACCOUNTS, ACTIVITIES, BOT_STATE, COMPANIES, COMPANY_REQUESTS, PORTFOLIOS, SIGNALS,
+};
 use crm_core::market::MarketConfig;
 use crm_core::meili::{self, Client};
 use crm_core::model::{Account, AccountStatus, Activity, Company, Signal};
+use crm_core::portfolio::{PortfolioStatus, RuntimePortfolio};
 use crm_core::request::CompanyRequest;
 use meilisearch_sdk::errors::{Error as MeiliError, ErrorCode};
 use meilisearch_sdk::search::{SearchQuery, Selectors};
@@ -342,6 +345,62 @@ impl AppState {
             .await
             .context("writing the request")?;
         Ok(())
+    }
+
+    // --------------------------------------------------------- portfolios
+
+    /// Every portfolio added at runtime, enabled or not.
+    pub async fn runtime_portfolios(&self) -> Result<Vec<RuntimePortfolio>> {
+        Ok(self
+            .search(PORTFOLIOS, "", "", &["added_at:asc"], None, MAX_HITS, 0)
+            .await?
+            .hits)
+    }
+
+    pub async fn runtime_portfolio(&self, slug: &str) -> Result<Option<RuntimePortfolio>> {
+        self.get(PORTFOLIOS, slug).await
+    }
+
+    pub async fn write_portfolio(&self, p: &RuntimePortfolio) -> Result<()> {
+        meili::upsert_chunked(&self.writer, PORTFOLIOS, std::slice::from_ref(p))
+            .await
+            .context("writing the portfolio")?;
+        Ok(())
+    }
+
+    /// The indexer's record of each portfolio's latest read, by slug.
+    pub async fn portfolio_statuses(&self, slugs: &[String]) -> HashMap<String, PortfolioStatus> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default)]
+            value: Option<Value>,
+        }
+        let ids: Vec<String> = slugs.iter().map(|s| PortfolioStatus::state_id(s)).collect();
+        let mut f = Filter::default();
+        f.any_of("id", &ids);
+        match self
+            .search::<Row>(
+                BOT_STATE,
+                "",
+                &f.build(),
+                &[],
+                Some(&["value"]),
+                ids.len().max(1),
+                0,
+            )
+            .await
+        {
+            Ok(page) => page
+                .hits
+                .into_iter()
+                .filter_map(|r| serde_json::from_value::<PortfolioStatus>(r.value?).ok())
+                .map(|s| (s.slug.clone(), s))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read portfolio statuses");
+                HashMap::new()
+            }
+        }
     }
 
     // -------------------------------------------------------------- stats

@@ -20,13 +20,15 @@ pub const ACCOUNTS: &str = "accounts";
 pub const ACTIVITIES: &str = "activities";
 /// `add_company` requests: written through MCP, consumed by the indexer.
 pub const COMPANY_REQUESTS: &str = "company_requests";
+/// Portfolios added at runtime: written through MCP, swept by the indexer.
+pub const PORTFOLIOS: &str = "portfolios";
 /// Indexer bookkeeping: per-source cursors and the crawl frontier.
 pub const BOT_STATE: &str = "bot_state";
 
 /// Indexes the indexer writes and the MCP server only reads.
 pub const MARKET_INDEXES: [&str; 2] = [COMPANIES, SIGNALS];
 /// Indexes the MCP server writes.
-pub const CRM_INDEXES: [&str; 3] = [ACCOUNTS, ACTIVITIES, COMPANY_REQUESTS];
+pub const CRM_INDEXES: [&str; 4] = [ACCOUNTS, ACTIVITIES, COMPANY_REQUESTS, PORTFOLIOS];
 
 /// Ceiling on how long a single search may run, in milliseconds.
 const SEARCH_CUTOFF_MS: u64 = 1_500;
@@ -155,6 +157,13 @@ fn request_settings() -> Settings {
         .with_sortable_attributes(["requested_at", "updated_at"])
 }
 
+fn portfolio_settings() -> Settings {
+    Settings::new()
+        .with_searchable_attributes(["investor", "slug", "url"])
+        .with_filterable_attributes(["id", "enabled", "investor", "kind"])
+        .with_sortable_attributes(["added_at", "updated_at"])
+}
+
 /// `id` must be filterable here: the frontier is read back a batch of ids at
 /// a time rather than one document per request.
 fn state_settings() -> Settings {
@@ -174,6 +183,7 @@ pub async fn ensure_indexes(client: &Client, market: &MarketConfig) -> Result<()
     ensure_one(client, ACCOUNTS, &account_settings(market)).await?;
     ensure_one(client, ACTIVITIES, &activity_settings(market)).await?;
     ensure_one(client, COMPANY_REQUESTS, &request_settings()).await?;
+    ensure_one(client, PORTFOLIOS, &portfolio_settings()).await?;
     ensure_one(client, BOT_STATE, &state_settings()).await?;
     tracing::info!(
         market = %market.name,
@@ -228,6 +238,7 @@ mod tests {
             account_settings(&m),
             activity_settings(&m),
             request_settings(),
+            portfolio_settings(),
             state_settings(),
         ] {
             assert!(filterable_names(&s).contains(&"id".to_string()));

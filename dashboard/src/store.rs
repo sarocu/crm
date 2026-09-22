@@ -4,10 +4,13 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use crm_core::index::{ACCOUNTS, ACTIVITIES, COMPANIES, COMPANY_REQUESTS, SIGNALS};
+use crm_core::index::{
+    ACCOUNTS, ACTIVITIES, BOT_STATE, COMPANIES, COMPANY_REQUESTS, PORTFOLIOS, SIGNALS,
+};
 use crm_core::market::MarketConfig;
 use crm_core::meili::Client;
 use crm_core::model::{Account, AccountStatus, Activity, Company, Signal};
+use crm_core::portfolio::{PortfolioStatus, RuntimePortfolio};
 use crm_core::request::CompanyRequest;
 use meilisearch_sdk::search::{SearchQuery, Selectors};
 use serde::Deserialize;
@@ -322,6 +325,66 @@ impl Store {
         )
         .await
         .map(|(v, _)| v)
+    }
+}
+
+/// One row of the portfolios page.
+pub struct PortfolioRow {
+    pub portfolio: crm_core::market::Portfolio,
+    /// `config` or `runtime`.
+    pub origin: &'static str,
+    pub enabled: bool,
+    pub added_by: Option<String>,
+    pub companies: usize,
+    pub status: Option<PortfolioStatus>,
+}
+
+impl Store {
+    pub async fn portfolios(&self) -> Vec<PortfolioRow> {
+        let mut rows: Vec<PortfolioRow> = self
+            .market
+            .portfolios
+            .iter()
+            .map(|p| PortfolioRow {
+                portfolio: p.clone(),
+                origin: "config",
+                enabled: true,
+                added_by: None,
+                companies: 0,
+                status: None,
+            })
+            .collect();
+        let runtime: Vec<RuntimePortfolio> = self
+            .search(PORTFOLIOS, "", "", &["added_at:asc"], 1000, 0)
+            .await
+            .map(|(v, _)| v)
+            .unwrap_or_default();
+        for r in runtime {
+            if !rows.iter().any(|x| x.portfolio.slug == r.portfolio.slug) {
+                rows.push(PortfolioRow {
+                    portfolio: r.portfolio,
+                    origin: "runtime",
+                    enabled: r.enabled,
+                    added_by: Some(r.added_by),
+                    companies: 0,
+                    status: None,
+                });
+            }
+        }
+        let counts = self
+            .facet(COMPANIES, "investors", "merged_into NOT EXISTS")
+            .await;
+        for row in &mut rows {
+            row.companies = counts.get(&row.portfolio.investor).copied().unwrap_or(0);
+            row.status = self
+                .client
+                .index(BOT_STATE)
+                .get_document::<Value>(&PortfolioStatus::state_id(&row.portfolio.slug))
+                .await
+                .ok()
+                .and_then(|d| serde_json::from_value(d.get("value")?.clone()).ok());
+        }
+        rows
     }
 }
 
