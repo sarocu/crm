@@ -1,0 +1,48 @@
+{
+  "id": "prospectbot",
+  "namespace": "samcurrie",
+  "routes": [
+    {
+      "host": "prospectbot.us2.heyo.work"
+    }
+  ],
+  "health": {
+    "path": "/healthz",
+    "timeout_secs": 5
+  },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 16,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 180,
+    "boot_timeout_secs": 600,
+    "drain_timeout_secs": 60,
+    "idle_action": "destroy"
+  },
+  "build": {
+    "repo": "https://github.com/sarocu/crm.git",
+    "ref": "crm-pivot",
+    "dockerfile": "bot/Dockerfile",
+    "context": ".",
+    "image_name": "prospectbot",
+    "image_size_mb": 1024
+  },
+  "vm": {
+    "driver": "firecracker",
+    "port": 8081,
+    "size_class": "small",
+    "env_vars": {
+      "PORT": "8081",
+      "BIND_HOST": "0.0.0.0",
+      "MARKET_CONFIG": "/etc/crm/market.toml",
+      "RUST_LOG": "info",
+      "MEILI_URL": "https://crmdata.us2.heyo.work",
+      "MEILI_MASTER_KEY": "<crmdata master key: cat /workspace/master.key in the crmdata VM>",
+      "CONTACT_EMAIL": "<a contact address you monitor>"
+    },
+    "start_command": "setsid nohup /usr/local/bin/bot </dev/null >>/var/log/bot.log 2>&1 &",
+    "ttl_seconds": 3600
+  }
+}
