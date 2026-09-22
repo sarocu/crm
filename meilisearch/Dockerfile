@@ -11,7 +11,9 @@ FROM getmeili/meilisearch:v1.53.2
 # apt. `iproute2` and `openssh` are what a Firecracker guest needs beyond the
 # application: /init.sh configures eth0 with `ip` from the kernel's `ip=`
 # parameter, and sshd is what backs `heyctl exec` and `heyctl shell`.
-RUN apk add --no-cache openssh iproute2 curl \
+# `socat` is what the heyo host uses to reach into the guest for exec and to
+# tail its logs; without it a failing VM has nothing to say.
+RUN apk add --no-cache openssh iproute2 curl socat \
     && mkdir -p /run/sshd /etc/ssh/sshd_config.d \
     && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
     && echo "PermitEmptyPasswords yes" >> /etc/ssh/sshd_config \
@@ -31,6 +33,11 @@ RUN chmod +x /init.sh \
     && echo 'crm-meili' > /etc/hostname
 
 COPY meilisearch/config.toml /etc/meilisearch/config.toml
+
+# The app-lb start_command: runs Meilisearch with its database, dumps and
+# master key on the persistent /workspace. See rootfs/meili-start.sh.
+COPY rootfs/meili-start.sh /usr/local/bin/meili-start
+RUN chmod +x /usr/local/bin/meili-start
 
 ENV MEILI_CONFIG_FILE_PATH=/etc/meilisearch/config.toml \
     MEILI_ENV=production \

@@ -1,0 +1,35 @@
+{
+  "id": "crmdata",
+  "namespace": "samcurrie",
+  "routes": [{ "host": "crmdata.us2.heyo.work" }],
+  "health": { "path": "/health", "timeout_secs": 5 },
+  "scaling": {
+    "min_replicas": 1,
+    "max_replicas": 1,
+    "warm_pool": 0,
+    "target_concurrency": 64,
+    "scale_to_zero_after_secs": 0,
+    "cold_start_timeout_secs": 180,
+    "boot_timeout_secs": 600,
+    "drain_timeout_secs": 30,
+    "idle_action": "destroy"
+  },
+  "build": {
+    "repo": "https://github.com/sarocu/crm.git",
+    "ref": "crm-pivot",
+    "dockerfile": "meilisearch/Dockerfile",
+    "context": ".",
+    "image_name": "crmdata",
+    "image_size_mb": 2048
+  },
+  "vm": {
+    "driver": "firecracker",
+    "port": 7700,
+    "size_class": "small",
+    "disk_size_gb": 10,
+    "workspace": { "store": "/var/lib/heyvm/workspace-store" },
+    "env_vars": { "MEILI_NO_ANALYTICS": "true" },
+    "start_command": "/usr/local/bin/meili-start",
+    "ttl_seconds": 3600
+  }
+}
