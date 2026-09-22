@@ -1,13 +1,19 @@
 //! The MCP tool surface.
 //!
 //! Tool descriptions are the only documentation a model gets, so they carry
-//! the operational detail: what the region is, what a parameter does, and
-//! what to call when a guess does not resolve.
+//! the operational detail: what a parameter does, what to call next, and
+//! what to do when a guess does not resolve.
 
 use std::sync::Arc;
 
-use regional_core::model::Kind;
-use regional_core::region::City;
+use axum::http::request::Parts;
+use crm_core::id::{company_id, root_domain};
+use crm_core::index::{ACCOUNTS, ACTIVITIES, COMPANIES, SIGNALS};
+use crm_core::model::{
+    Account, AccountStatus, Activity, ActivityType, Company, Signal, SignalKind, now_ts,
+};
+use crm_core::request::{CompanyRequest, RequestStatus};
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ErrorData, Implementation, ServerCapabilities, ServerConfig,
@@ -17,18 +23,27 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::auth::Actor;
 use crate::filter::Filter;
-use crate::geo;
 use crate::render;
-use crate::search::{self, DEFAULT_LIMIT, Hit, MAX_LIMIT, Params, to_hit};
-use crate::state::AppState;
+use crate::score::{self, Fit};
+use crate::state::{AppState, COMPANY_FIELDS, LIVE, MAX_HITS, Page};
+
+/// Hard ceiling on `limit`, so one tool call cannot pull the whole index
+/// into a model's context window.
+pub const MAX_LIMIT: usize = 50;
+pub const DEFAULT_LIMIT: usize = 10;
+/// Candidates `find_prospects` scores before picking the best.
+const PROSPECT_POOL: usize = 200;
+/// Signals and activities shown in a dossier.
+const DOSSIER_ITEMS: usize = 20;
 
 #[derive(Clone)]
-pub struct RegionalSearch {
+pub struct CrmServer {
     state: Arc<AppState>,
 }
 
-impl RegionalSearch {
+impl CrmServer {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }
     }
@@ -37,582 +52,1300 @@ impl RegionalSearch {
 // ---------------------------------------------------------------- arguments
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchRegionArgs {
-    /// What to look for, in plain words: "wood fired pizza", "vineyard",
-    /// "hot springs", "ski rentals". Do not put the place name in here —
-    /// use `city` or `near` for that, which filter geographically instead
-    /// of just matching text.
-    pub query: String,
-
-    /// Restrict to some content kinds: "place", "event", "article".
-    /// Omit to search all three and get one merged, relevance-ranked list.
+pub struct SearchCompaniesArgs {
+    /// Free text matched against name, domain, description, industries and
+    /// site text: "cold storage", "netsuite", "acme". Omit to browse by
+    /// filters alone.
     #[serde(default)]
-    pub kinds: Option<Vec<String>>,
-
-    /// A town, neighbourhood or landmark to search around. Resolved against
-    /// the region's gazetteer first, then against indexed places. Prefer
-    /// this over putting the location in `query`.
+    pub query: Option<String>,
+    /// Vertical slugs or names (see list_verticals). Any of them matches.
     #[serde(default)]
-    pub near: Option<String>,
-
-    /// Radius in metres around `near` / `city`. Defaults to a sensible
-    /// radius for the resolved place (larger for rural towns than for
-    /// dense city centres).
+    pub verticals: Option<Vec<String>>,
+    /// Apply a profile's hard filters (verticals, territory, size range) on
+    /// top of the others. Use find_prospects instead to rank by fit.
     #[serde(default)]
-    pub radius_m: Option<u32>,
-
-    /// A town or city to limit results to. Known towns become a radius
-    /// around the town centre, which is far more reliable than matching
-    /// the city name on each document. Call `list_locales` for the list.
+    pub profile: Option<String>,
+    /// HQ country codes, ISO 3166-1 alpha-2: ["US", "CA"].
     #[serde(default)]
-    pub city: Option<String>,
-
-    /// A county name to limit results to, matched exactly. `list_locales`
-    /// shows the county names this server uses.
+    pub countries: Option<Vec<String>>,
+    /// HQ state or province codes: ["CO", "UT"].
     #[serde(default)]
-    pub county: Option<String>,
-
-    /// Category values to require, e.g. ["restaurant"], ["winery"]. A hit
-    /// needs any one of them. `describe_region` lists the live values.
+    pub states: Option<Vec<String>>,
     #[serde(default)]
-    pub categories: Option<Vec<String>>,
-
-    /// How many results to return. Default 10, maximum 50.
+    pub min_employees: Option<u64>,
+    #[serde(default)]
+    pub max_employees: Option<u64>,
+    /// Only companies with a signal of these kinds since `signal_since`:
+    /// hiring, funding, launch, leadership, filing, news. Pass [] or omit
+    /// to not filter on signals.
+    #[serde(default)]
+    pub has_signals: Option<Vec<String>>,
+    /// Lower bound for `has_signals` (ISO-8601, YYYY-MM-DD or unix
+    /// seconds). Defaults to 90 days ago.
+    #[serde(default)]
+    pub signal_since: Option<String>,
+    /// Only companies whose account is in one of these statuses. "none"
+    /// matches companies with no account yet.
+    #[serde(default)]
+    pub statuses: Option<Vec<String>>,
+    /// Leave out companies whose account is in one of these statuses.
+    #[serde(default)]
+    pub exclude_statuses: Option<Vec<String>>,
+    /// Tech seen on their site: ["netsuite", "shopify"].
+    #[serde(default)]
+    pub tech: Option<Vec<String>>,
+    /// "relevance" (default with a query), "recent_signal" (default
+    /// without), "employees" or "name".
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Max results, default 10, capped at 50.
     #[serde(default)]
     pub limit: Option<usize>,
-
-    /// How many results to skip, for paging through a large result set.
     #[serde(default)]
     pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindNearbyArgs {
-    /// A town, neighbourhood or landmark to measure distance from. Give
-    /// this or `lat`+`lng`.
-    #[serde(default)]
-    pub near: Option<String>,
-
-    /// Latitude, if you already have coordinates. Must be inside the region.
-    #[serde(default)]
-    pub lat: Option<f64>,
-
-    /// Longitude, if you already have coordinates.
-    #[serde(default)]
-    pub lng: Option<f64>,
-
-    /// Optional text to narrow results, e.g. "coffee". Omit to get whatever
-    /// is closest regardless of what it is.
+pub struct FindProspectsArgs {
+    /// Profile slug or name (see list_profiles).
+    pub profile: String,
+    /// Optional text to narrow the pool first: "cold storage".
     #[serde(default)]
     pub query: Option<String>,
-
-    /// Search radius in metres. Defaults to 5000 (about 3 miles).
+    /// Max results, default 10, capped at 50.
     #[serde(default)]
-    pub radius_m: Option<u32>,
+    pub limit: Option<usize>,
+    /// Include companies already contacted, engaged, in a meeting,
+    /// qualified or disqualified, and nurture accounts not yet due.
+    /// Default false.
+    #[serde(default)]
+    pub include_worked: Option<bool>,
+    /// Drop anything scoring below this, 0–100. Default 0.
+    #[serde(default)]
+    pub min_score: Option<u8>,
+}
 
-    /// Restrict to some content kinds: "place", "event", "article".
-    /// Defaults to places only, which is what proximity usually means.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetCompanyArgs {
+    /// A company `id` from any result, a domain or URL ("acme.com"), or an
+    /// exact company name.
+    pub company: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchSignalsArgs {
+    /// Free text over signal titles and summaries: "series b", "planner".
+    #[serde(default)]
+    pub query: Option<String>,
+    /// hiring, funding, launch, leadership, filing, news.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
-
-    /// Category values to require; a hit needs any one of them.
+    /// Earliest `occurred_at` (ISO-8601, YYYY-MM-DD or unix seconds).
+    /// Defaults to 30 days ago.
     #[serde(default)]
-    pub categories: Option<Vec<String>>,
-
-    /// How many results to return. Default 10, maximum 50.
+    pub since: Option<String>,
     #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchEventsArgs {
-    /// Optional text to match, e.g. "bluegrass", "farmers market".
+    pub until: Option<String>,
+    /// Vertical slugs or names.
     #[serde(default)]
-    pub query: Option<String>,
-
-    /// A town, neighbourhood or landmark to search around.
+    pub verticals: Option<Vec<String>>,
+    /// Limit to one company (id, domain or exact name).
     #[serde(default)]
-    pub near: Option<String>,
-
-    /// Radius in metres around `near`.
+    pub company: Option<String>,
+    /// Role families for hiring signals: sales, marketing, operations,
+    /// supply chain, production, finance, engineering, …
     #[serde(default)]
-    pub radius_m: Option<u32>,
-
-    /// A town or city to limit results to.
-    #[serde(default)]
-    pub city: Option<String>,
-
-    /// Only events starting at or after this time, as an ISO-8601 datetime
-    /// ("2026-07-04T00:00:00Z") or a unix timestamp. Defaults to now, so
-    /// past events are excluded unless you ask for them.
-    #[serde(default)]
-    pub starts_after: Option<String>,
-
-    /// Only events starting at or before this time. Same formats as
-    /// `starts_after`.
-    #[serde(default)]
-    pub starts_before: Option<String>,
-
-    /// How many results to return. Default 10, maximum 50.
+    pub roles: Option<Vec<String>>,
     #[serde(default)]
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListLocalesArgs {
-    /// Only list the locales in this county, e.g. "Chaffee" or "Chaffee
-    /// County". Omit to list every locale in the region.
     #[serde(default)]
-    pub county: Option<String>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetDocumentArgs {
-    /// The `id` from a search result.
-    pub id: String,
-    /// Which kind it was: "place", "event" or "article". Search results
-    /// carry this in their `kind` field.
-    pub kind: String,
+pub struct UpdateAccountArgs {
+    /// Company id, domain or exact name.
+    pub company: String,
+    /// new, researching, queued, contacted, engaged, meeting, qualified,
+    /// disqualified, nurture.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// What happens next, in a sentence.
+    #[serde(default)]
+    pub next_step: Option<String>,
+    /// When to touch next (ISO-8601, YYYY-MM-DD or unix seconds). Required
+    /// in spirit for nurture: prospecting skips nurture accounts until then.
+    #[serde(default)]
+    pub next_touch_at: Option<String>,
+    /// Required when setting status to disqualified.
+    #[serde(default)]
+    pub disqualify_reason: Option<String>,
+    /// The profile this account was qualified against.
+    #[serde(default)]
+    pub fit_profile: Option<String>,
+    /// Replaces the tag list.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Why, recorded on the status-change activity.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LogActivityArgs {
+    /// Company id, domain or exact name.
+    pub company: String,
+    /// email, call, linkedin, meeting or note.
+    #[serde(rename = "type")]
+    pub activity_type: String,
+    /// outbound or inbound. Defaults to outbound for email, call and
+    /// linkedin.
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// What was said or sent, briefly.
+    pub summary: String,
+    /// e.g. sent, no_answer, voicemail, replied, bounced, booked,
+    /// not_interested.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// When it happened. Defaults to now.
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddCompanyArgs {
+    /// The company's domain or website URL: "acme.com".
+    pub domain: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Vertical slugs or names you believe apply.
+    #[serde(default)]
+    pub verticals: Option<Vec<String>>,
+    /// Why it is being added.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 // -------------------------------------------------------------------- tools
 
 #[tool_router]
-impl RegionalSearch {
-    /// Search everything indexed for this region: places, events and
-    /// articles, merged into one ranked list.
-    ///
-    /// This is the tool to reach for first. Put the subject in `query` and
-    /// the location in `city` or `near` — the location parameters filter on
-    /// real coordinates, so they find things a text match would miss.
+impl CrmServer {
     #[tool(
-        name = "search_region",
-        description = "Search the region's indexed places, events and articles by text, with optional geographic and category filters. Put the subject in `query` and the location in `city` or `near`. Returns one relevance-ranked list across all content kinds."
+        name = "describe_market",
+        description = "Overview of this CRM: the industry verticals and customer profiles it is configured for, how many companies, signals, accounts and activities are indexed, how fresh each index is, the pipeline broken down by status, and recent signal volume by kind. Call this first."
     )]
-    async fn search_region(
+    async fn describe_market(&self) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let m = &st.market;
+        let now = now_ts();
+
+        let mut counts = serde_json::Map::new();
+        for idx in [COMPANIES, SIGNALS, ACCOUNTS, ACTIVITIES] {
+            let filter = if idx == COMPANIES { LIVE } else { "" };
+            counts.insert(idx.into(), json!(st.count(idx, filter).await));
+        }
+        let mut fresh = serde_json::Map::new();
+        for (idx, field) in [
+            (COMPANIES, "updated_at"),
+            (SIGNALS, "occurred_at"),
+            (ACCOUNTS, "updated_at"),
+            (ACTIVITIES, "occurred_at"),
+        ] {
+            fresh.insert(
+                idx.into(),
+                json!(render::fmt_ts_opt(st.newest(idx, field).await)),
+            );
+        }
+        let by_vertical = st
+            .facet(COMPANIES, "verticals", LIVE)
+            .await
+            .unwrap_or_default();
+        let pipeline = st.facet(ACCOUNTS, "status", "").await.unwrap_or_default();
+        let recent = st
+            .facet(
+                SIGNALS,
+                "kind",
+                &format!("occurred_at >= {}", now - 90 * 86_400),
+            )
+            .await
+            .unwrap_or_default();
+        let sizes = st
+            .facet(COMPANIES, "employees_band", LIVE)
+            .await
+            .unwrap_or_default();
+        let countries = st
+            .facet(COMPANIES, "hq_country", LIVE)
+            .await
+            .unwrap_or_default();
+
+        let value = json!({
+            "market": m.name,
+            "slug": m.slug,
+            "counts": counts,
+            "last_updated": fresh,
+            "verticals": m.verticals.iter().map(|v| json!({
+                "slug": v.slug,
+                "name": v.name,
+                "companies": by_vertical.get(&v.slug).copied().unwrap_or(0),
+            })).collect::<Vec<_>>(),
+            "profiles": m.profiles.iter().map(|p| json!({
+                "slug": p.slug,
+                "name": p.name,
+                "description": p.description,
+            })).collect::<Vec<_>>(),
+            "pipeline": pipeline,
+            "signals_last_90_days": recent,
+            "company_sizes": sizes,
+            "hq_countries": countries,
+            "account_statuses": AccountStatus::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "signal_kinds": SignalKind::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        });
+        Ok(respond(render::market(&value, m), value))
+    }
+
+    #[tool(
+        name = "list_verticals",
+        description = "List the industry verticals companies are classified into, with the SIC/NAICS codes and keywords that put a company in each and how many companies each has. Vertical slugs are what `verticals` arguments take."
+    )]
+    async fn list_verticals(&self) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let counts = st
+            .facet(COMPANIES, "verticals", LIVE)
+            .await
+            .unwrap_or_default();
+        let text: String = st
+            .market
+            .verticals
+            .iter()
+            .map(|v| render::vertical(v, counts.get(&v.slug).copied()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let value = json!({
+            "verticals": st.market.verticals.iter().map(|v| {
+                let mut j = serde_json::to_value(v).unwrap_or_default();
+                j["companies"] = json!(counts.get(&v.slug).copied().unwrap_or(0));
+                j
+            }).collect::<Vec<_>>(),
+        });
+        Ok(respond(text, value))
+    }
+
+    #[tool(
+        name = "list_profiles",
+        description = "List the ideal customer profiles: for each, the verticals, territory, headcount range, hiring roles and keywords it looks for, and how much each criterion weighs in the fit score. Profile slugs are what find_prospects and search_companies take."
+    )]
+    async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
+        let m = &self.state.market;
+        let text = m
+            .profiles
+            .iter()
+            .map(render::profile)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(respond(text, json!({ "profiles": m.profiles })))
+    }
+
+    #[tool(
+        name = "search_companies",
+        description = "Search and filter companies by text, vertical, territory, headcount, tech, recent signals and pipeline status. Each result carries its id, firmographics, last signal date and account status. Use find_prospects to rank by fit to a profile; use get_company for one company's full dossier."
+    )]
+    async fn search_companies(
         &self,
-        Parameters(args): Parameters<SearchRegionArgs>,
+        Parameters(args): Parameters<SearchCompaniesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let st = &self.state;
-        let kinds = match parse_kinds(args.kinds.as_deref(), &Kind::ALL) {
-            Ok(k) => k,
-            Err(e) => return Ok(user_error(e)),
-        };
         let limit = clamp_limit(args.limit);
-        let offset = args.offset.unwrap_or(0);
+        let offset = args.offset.unwrap_or(0).min(MAX_HITS.saturating_sub(limit));
+        let query = args.query.clone().unwrap_or_default();
 
-        let mut filter = Filter::within(&st.region.geo_filter());
-        let mut anchor_note = None;
-
-        // `city` and `near` both become a radius when we can resolve them.
-        let place = args.near.as_deref().or(args.city.as_deref());
-        if let Some(name) = place {
-            match geo::resolve(st, name).await {
-                Ok(a) => {
-                    let radius = args.radius_m.unwrap_or(a.default_radius_m);
-                    filter.geo_radius(a.geo.lat, a.geo.lng, radius);
-                    anchor_note = Some(format!(
-                        "within {:.0} km of {} (matched via {})",
-                        radius as f64 / 1000.0,
-                        a.label,
-                        a.via
+        let mut f = Filter::new(LIVE);
+        if let Some(v) = args.verticals.as_deref() {
+            match self.verticals(v) {
+                Ok(slugs) => f.any_of("verticals", &slugs),
+                Err(e) => return Ok(user_error(e)),
+            };
+        }
+        if let Some(p) = args.profile.as_deref() {
+            let Some(profile) = st.market.resolve_profile(p) else {
+                return Ok(user_error(self.no_profile(p)));
+            };
+            apply_profile(&mut f, profile);
+        }
+        if let Some(c) = &args.countries {
+            let up: Vec<String> = c.iter().map(|x| x.trim().to_uppercase()).collect();
+            f.any_of("hq_country", &up);
+        }
+        if let Some(s) = &args.states {
+            f.any_of("hq_state", s);
+        }
+        if let Some(n) = args.min_employees {
+            f.gte("employees", n as i64);
+        }
+        if let Some(n) = args.max_employees {
+            f.lte("employees", n as i64);
+        }
+        if let Some(t) = &args.tech {
+            let lower: Vec<String> = t.iter().map(|x| x.trim().to_lowercase()).collect();
+            f.any_of("tech", &lower);
+        }
+        if let Some(kinds) = args.has_signals.as_deref().filter(|k| !k.is_empty()) {
+            let kinds = match parse_kinds(kinds) {
+                Ok(k) => k,
+                Err(e) => return Ok(user_error(e)),
+            };
+            let since = match parse_time(args.signal_since.as_deref()) {
+                Ok(t) => t.unwrap_or_else(|| now_ts() - 90 * 86_400),
+                Err(e) => return Ok(user_error(e)),
+            };
+            let mut sf = Filter::default();
+            sf.any_of("kind", &kinds).gte("occurred_at", since);
+            match st.companies_with_signals(&sf.build()).await {
+                Ok(ids) if ids.is_empty() => {
+                    return Ok(respond(
+                        format!(
+                            "No company has a {} signal since {}.",
+                            kinds.join("/"),
+                            render::fmt_ts(since)
+                        ),
+                        json!({ "results": [], "estimated_total": 0 }),
                     ));
                 }
-                Err(msg) => {
-                    // An unresolvable `city` still has a chance as a plain
-                    // string match; an unresolvable `near` does not.
-                    if args.near.is_some() {
-                        return Ok(user_error(msg));
-                    }
-                    filter.eq("city", name);
-                    anchor_note = Some(format!("with city exactly {name:?}"));
+                Ok(ids) => {
+                    f.any_of("id", &ids);
                 }
+                Err(e) => return Ok(backend_error("search_companies", e)),
             }
         }
-        if let Some(county) = args.county.as_deref() {
-            filter.eq("county", county);
-        }
-        if let Some(cats) = args.categories.as_deref() {
-            filter.any_of("categories", cats);
-        }
-
-        let params = Params {
-            query: args.query.clone(),
-            filter: filter.build(),
-            sort: vec![],
-            limit,
-            offset,
-        };
-        let indexes = search::indexes_for(&kinds);
-        let page = match search::search_federated(&st.client, &indexes, &params).await {
-            Ok(p) => p,
-            Err(e) => return Ok(backend_error("search_region", e)),
-        };
-
-        let hits = shape(st, page.hits);
-        let header = render::header(
-            &st.region.name,
-            &format!("{:?}", args.query),
-            anchor_note.as_deref(),
-            hits.len(),
-            page.estimated_total,
-            offset,
-        );
-        Ok(respond(
-            render::hits(&header, &hits),
-            json!({
-                "region": st.region.name,
-                "query": args.query,
-                "kinds": kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
-                "scope": anchor_note,
-                "estimated_total": page.estimated_total,
-                "offset": offset,
-                "results": hits,
-            }),
-        ))
-    }
-
-    /// Find what is physically closest to a point, ordered by distance.
-    #[tool(
-        name = "find_nearby",
-        description = "Find indexed content closest to a point, strictly ordered by true distance. Give `near` (a town or landmark) or `lat`+`lng`. Each result carries `distance_m`. Use this for proximity questions (\"closest coffee to my hotel\"); use search_region when relevance matters more than distance."
-    )]
-    async fn find_nearby(
-        &self,
-        Parameters(args): Parameters<FindNearbyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let st = &self.state;
-        let kinds = match parse_kinds(args.kinds.as_deref(), &[Kind::Place]) {
-            Ok(k) => k,
-            Err(e) => return Ok(user_error(e)),
-        };
-        let limit = clamp_limit(args.limit);
-
-        let anchor = match geo::resolve_any(st, args.near.as_deref(), args.lat, args.lng).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                return Ok(user_error(
-                    "find_nearby needs a location: pass `near` (a town or landmark) or both `lat` and `lng`."
-                        .to_string(),
-                ));
-            }
-            Err(msg) => return Ok(user_error(msg)),
-        };
-        let radius = args.radius_m.unwrap_or(5_000);
-
-        let mut filter = Filter::within(&st.region.geo_filter());
-        filter.geo_radius(anchor.geo.lat, anchor.geo.lng, radius);
-        if let Some(cats) = args.categories.as_deref() {
-            filter.any_of("categories", cats);
-        }
-
-        let params = Params {
-            query: args.query.clone().unwrap_or_default(),
-            filter: filter.build(),
-            sort: vec![format!(
-                "_geoPoint({}, {}):asc",
-                anchor.geo.lat, anchor.geo.lng
-            )],
-            limit,
-            offset: 0,
-        };
-        let indexes = search::indexes_for(&kinds);
-        let page = match search::search_nearby(&st.client, &indexes, &params).await {
-            Ok(p) => p,
-            Err(e) => return Ok(backend_error("find_nearby", e)),
-        };
-
-        let hits = shape(st, page.hits);
-        let header = format!(
-            "{} result(s) within {:.1} km of {} in {}",
-            hits.len(),
-            radius as f64 / 1000.0,
-            anchor.label,
-            st.region.name
-        );
-        Ok(respond(
-            render::hits(&header, &hits),
-            json!({
-                "region": st.region.name,
-                "anchor": { "label": anchor.label, "lat": anchor.geo.lat, "lng": anchor.geo.lng, "via": anchor.via },
-                "radius_m": radius,
-                "results": hits,
-            }),
-        ))
-    }
-
-    /// Search events by time window and location.
-    #[tool(
-        name = "search_events",
-        description = "Search events in the region within a time window, sorted soonest first. Defaults to upcoming events only. Accepts ISO-8601 datetimes or unix timestamps for `starts_after` / `starts_before`."
-    )]
-    async fn search_events(
-        &self,
-        Parameters(args): Parameters<SearchEventsArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let st = &self.state;
-        let limit = clamp_limit(args.limit);
-
-        let after = match parse_time(args.starts_after.as_deref()) {
-            Ok(v) => v.unwrap_or_else(regional_core::model::now_ts),
-            Err(e) => return Ok(user_error(e)),
-        };
-        let before = match parse_time(args.starts_before.as_deref()) {
-            Ok(v) => v,
-            Err(e) => return Ok(user_error(e)),
-        };
-        if let Some(b) = before
-            && b < after
-        {
-            return Ok(user_error(
-                "starts_before is earlier than starts_after, so no event can match".to_string(),
-            ));
-        }
-
-        let mut filter = Filter::within(&st.region.geo_filter());
-        filter.gte("start_time", after);
-        if let Some(b) = before {
-            filter.lte("start_time", b);
-        }
-
-        let mut window = format!("from {}", search::fmt_ts(after).unwrap_or_default());
-        if let Some(b) = before {
-            window.push_str(&format!(" to {}", search::fmt_ts(b).unwrap_or_default()));
-        }
-
-        let place = args.near.as_deref().or(args.city.as_deref());
-        if let Some(name) = place {
-            match geo::resolve(st, name).await {
-                Ok(a) => {
-                    let radius = args.radius_m.unwrap_or(a.default_radius_m);
-                    filter.geo_radius(a.geo.lat, a.geo.lng, radius);
-                    window.push_str(&format!(
-                        ", within {:.0} km of {}",
-                        radius as f64 / 1000.0,
-                        a.label
-                    ));
-                }
-                Err(msg) => return Ok(user_error(msg)),
-            }
-        }
-
-        let params = Params {
-            query: args.query.clone().unwrap_or_default(),
-            filter: filter.build(),
-            sort: vec!["start_time:asc".to_string()],
-            limit,
-            offset: 0,
-        };
-        let page = match search::search_one(&st.client, regional_core::index::EVENTS, &params).await
-        {
-            Ok(p) => p,
-            Err(e) => return Ok(backend_error("search_events", e)),
-        };
-
-        let hits = shape(st, page.hits);
-        let header = format!("{} event(s) in {}, {window}", hits.len(), st.region.name);
-        Ok(respond(
-            render::hits(&header, &hits),
-            json!({
-                "region": st.region.name,
-                "window": { "starts_after": after, "starts_before": before },
-                "estimated_total": page.estimated_total,
-                "results": hits,
-            }),
-        ))
-    }
-
-    /// Retrieve one document in full.
-    #[tool(
-        name = "get_document",
-        description = "Fetch the complete record for one document by its `id` and `kind`, including the full body text that search results truncate."
-    )]
-    async fn get_document(
-        &self,
-        Parameters(args): Parameters<GetDocumentArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let st = &self.state;
-        let Some(kind) = Kind::parse(&args.kind) else {
-            return Ok(user_error(format!(
-                "unknown kind {:?}; expected one of: place, event, article",
-                args.kind
-            )));
-        };
-        match st
-            .client
-            .index(kind.index())
-            .get_document::<Value>(&args.id)
+        match self
+            .status_filter(
+                &mut f,
+                args.statuses.as_deref(),
+                args.exclude_statuses.as_deref(),
+            )
             .await
         {
-            Ok(doc) => Ok(respond(render::document(&doc), doc)),
-            Err(e) => {
-                tracing::debug!(error = %e, id = %args.id, kind = %kind, "document lookup failed");
-                Ok(user_error(format!(
-                    "no {} with id {:?}. Ids come from search results and are only valid for the kind they were returned under.",
-                    kind, args.id
-                )))
+            Ok(Some(empty)) => return Ok(empty),
+            Ok(None) => {}
+            Err(e) => return Ok(user_error(e)),
+        }
+
+        let sort: Vec<&str> = match args.sort.as_deref().map(str::trim) {
+            None | Some("") => {
+                if query.is_empty() {
+                    vec!["last_signal_at:desc"]
+                } else {
+                    vec![]
+                }
+            }
+            Some("relevance") => vec![],
+            Some("recent_signal") => vec!["last_signal_at:desc"],
+            Some("employees") => vec!["employees:desc"],
+            Some("name") => vec!["name:asc"],
+            Some(other) => {
+                return Ok(user_error(format!(
+                    "unknown sort {other:?}; use relevance, recent_signal, employees or name"
+                )));
+            }
+        };
+
+        let page: Page<Company> = match st
+            .search(
+                COMPANIES,
+                &query,
+                &f.build(),
+                &sort,
+                Some(COMPANY_FIELDS),
+                limit,
+                offset,
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return Ok(backend_error("search_companies", e)),
+        };
+        let ids: Vec<String> = page.hits.iter().map(|c| c.id.clone()).collect();
+        let accounts = st.accounts_by_ids(&ids).await.unwrap_or_default();
+
+        let mut text = header("company", page.hits.len(), page.estimated_total, offset);
+        for (i, c) in page.hits.iter().enumerate() {
+            text.push_str(&render::company_entry(
+                i + offset,
+                c,
+                accounts.get(&c.id),
+                None,
+            ));
+        }
+        if page.hits.is_empty() {
+            text.push_str(
+                "Nothing matched. Loosen a filter, or call describe_market to see what is indexed.",
+            );
+        }
+        let results: Vec<Value> = page
+            .hits
+            .iter()
+            .map(|c| company_json(c, accounts.get(&c.id), None))
+            .collect();
+        Ok(respond(
+            text,
+            json!({ "estimated_total": page.estimated_total, "offset": offset, "results": results }),
+        ))
+    }
+
+    #[tool(
+        name = "find_prospects",
+        description = "Rank companies by fit to a customer profile and return the best ones to work next, each with a 0-100 fit score and the reasons behind it (vertical, size, territory, recent hiring in target roles, news, keywords). Companies already being worked are left out unless include_worked is true. This is the starting point for prospecting: pick from here, read get_company, then reach out and log_activity."
+    )]
+    async fn find_prospects(
+        &self,
+        Parameters(args): Parameters<FindProspectsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let Some(profile) = st.market.resolve_profile(&args.profile) else {
+            return Ok(user_error(self.no_profile(&args.profile)));
+        };
+        let limit = clamp_limit(args.limit);
+        let now = now_ts();
+
+        let mut f = Filter::new(LIVE);
+        apply_profile(&mut f, profile);
+        if !args.include_worked.unwrap_or(false) {
+            match st.skip_ids(now).await {
+                Ok(ids) => {
+                    f.none_of("id", &ids);
+                }
+                Err(e) => return Ok(backend_error("find_prospects", e)),
             }
         }
-    }
-
-    /// List the named places `city` and `near` resolve against.
-    #[tool(
-        name = "list_locales",
-        description = "List the locales this server resolves by name — the towns and cities `city` and `near` accept — with each one's aliases, county, coordinates and default search radius, grouped by county. Pass `county` to list one county. Use this to turn a county or a vague area into place names the other tools accept, and to find the county value `search_region` filters on."
-    )]
-    async fn list_locales(
-        &self,
-        Parameters(args): Parameters<ListLocalesArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let region = &self.state.region;
-        let county = args
-            .county
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty());
-        let mut locales: Vec<&City> = match county {
-            Some(county) => region.cities_in_county(county),
-            None => region.cities.iter().collect(),
+        // Most recently active first, so the pool is where the signals are.
+        let query = args.query.clone().unwrap_or_default();
+        let sort: &[&str] = if query.is_empty() {
+            &["last_signal_at:desc"]
+        } else {
+            &[]
         };
-        if let Some(county) = county
-            && locales.is_empty()
+        let pool: Page<Company> = match st
+            .search(COMPANIES, &query, &f.build(), sort, None, PROSPECT_POOL, 0)
+            .await
         {
-            return Ok(user_error(format!(
-                "no locales in a county called {county:?} in {}. Counties with locales: {}.",
-                region.name,
-                region.county_names().join(", ")
-            )));
-        }
-        // By county, so each county reads as one block; places with no county last.
-        locales.sort_by(|a, b| {
-            (a.county.is_none(), &a.county, &a.name).cmp(&(b.county.is_none(), &b.county, &b.name))
-        });
+            Ok(p) => p,
+            Err(e) => return Ok(backend_error("find_prospects", e)),
+        };
+        let ids: Vec<String> = pool.hits.iter().map(|c| c.id.clone()).collect();
+        let since = now - i64::from(profile.signals.recency_days) * 86_400;
+        let signals = match st.signals_for(&ids, Some(since), 25).await {
+            Ok(s) => s,
+            Err(e) => return Ok(backend_error("find_prospects", e)),
+        };
 
-        let value = json!({
-            "region": region.name,
-            // Echo the county as the gazetteer spells it, which is the value
-            // `search_region` matches, rather than however it was asked for.
-            "county": county.and(locales.first().and_then(|c| c.county.clone())),
-            "locales": locales
-                .iter()
-                .map(|c| json!({
-                    "name": c.name,
-                    "aliases": c.aliases,
-                    "county": c.county,
-                    "lat": c.lat,
-                    "lng": c.lng,
-                    "default_radius_m": c.default_radius_m,
-                }))
-                .collect::<Vec<_>>(),
+        let min = args.min_score.unwrap_or(0);
+        let mut ranked: Vec<(Fit, Company)> = pool
+            .hits
+            .into_iter()
+            .map(|c| {
+                let sig = signals.get(&c.id).map(Vec::as_slice).unwrap_or(&[]);
+                (score::score(&c, sig, profile, now), c)
+            })
+            .filter(|(fit, _)| fit.score >= min)
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.points
+                .total_cmp(&a.0.points)
+                .then(b.1.last_signal_at.cmp(&a.1.last_signal_at))
         });
-        Ok(respond(render::locales(&value), value))
+        let considered = ranked.len();
+        ranked.truncate(limit);
+
+        let ids: Vec<String> = ranked.iter().map(|(_, c)| c.id.clone()).collect();
+        let accounts = st.accounts_by_ids(&ids).await.unwrap_or_default();
+        let mut text = format!(
+            "Top {} of {considered} candidate(s) for profile {} ({}), scored on {} of {} in the pool{}.\n\n",
+            ranked.len(),
+            profile.slug,
+            profile.name,
+            considered.min(PROSPECT_POOL),
+            pool.estimated_total,
+            if args.include_worked.unwrap_or(false) {
+                ""
+            } else {
+                ", excluding accounts already being worked"
+            }
+        );
+        for (i, (fit, c)) in ranked.iter().enumerate() {
+            let mut c = c.clone();
+            c.body.clear();
+            text.push_str(&render::company_entry(
+                i,
+                &c,
+                accounts.get(&c.id),
+                Some(fit),
+            ));
+        }
+        if ranked.is_empty() {
+            text.push_str("No candidates. The profile's verticals may have no companies yet — check describe_market — or everything matching is already being worked.");
+        }
+        let results: Vec<Value> = ranked
+            .iter()
+            .map(|(fit, c)| company_json(c, accounts.get(&c.id), Some(fit)))
+            .collect();
+        Ok(respond(
+            text,
+            json!({ "profile": profile.slug, "pool": pool.estimated_total, "results": results }),
+        ))
     }
 
-    /// Describe the region and what is currently indexed.
     #[tool(
-        name = "describe_region",
-        description = "Describe this server's region: its name, bounding box, the place names it can resolve, how many documents of each kind are indexed, the live category values, and how fresh the index is. Call this first to discover valid `city` and `categories` values instead of guessing."
+        name = "get_company",
+        description = "Everything known about one company: firmographics, tech seen on their site, job board, our account status and next step, fit to every profile with reasons, the latest signals and the outreach activity log. Accepts an id, a domain or an exact name."
     )]
-    async fn describe_region(&self) -> Result<CallToolResult, ErrorData> {
+    async fn get_company(
+        &self,
+        Parameters(args): Parameters<GetCompanyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let st = &self.state;
-        let region = &st.region;
-        let counts = st.doc_counts().await;
-        let envelope = region.geo_filter();
+        let c = match self.company(&args.company).await {
+            Ok(c) => c,
+            Err(r) => return Ok(r),
+        };
+        let now = now_ts();
+        let (account, signals, activities) = tokio::join!(
+            st.account(&c.id),
+            st.signals_for(std::slice::from_ref(&c.id), None, DOSSIER_ITEMS),
+            st.activities(&c.id, DOSSIER_ITEMS),
+        );
+        let account = account.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "account lookup failed");
+            None
+        });
+        let signals: Vec<Signal> = signals
+            .ok()
+            .and_then(|mut m| m.remove(&c.id))
+            .unwrap_or_default();
+        let activities = activities.unwrap_or_default();
+        let fits: Vec<Fit> = st
+            .market
+            .profiles
+            .iter()
+            .map(|p| score::score(&c, &signals, p, now))
+            .collect();
 
-        let categories =
-            match search::facet_counts(&st.client, regional_core::index::PLACES, "categories", "")
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "facet lookup failed");
-                    Default::default()
-                }
+        let mut shown = c.clone();
+        shown.body.clear();
+        let text = render::dossier(&shown, account.as_ref(), &signals, &activities, &fits);
+        Ok(respond(
+            text,
+            json!({
+                "company": company_json(&shown, account.as_ref(), None),
+                "account": account,
+                "fit": fits,
+                "signals": signals.iter().map(signal_json).collect::<Vec<_>>(),
+                "activities": activities,
+            }),
+        ))
+    }
+
+    #[tool(
+        name = "search_signals",
+        description = "Search buying signals — job postings, funding, launches, leadership changes, SEC filings and press — newest first. Filter by kind, date range, vertical, company and hiring role family. Use this to find timely reasons to reach out, e.g. every company that posted a supply-chain role this month."
+    )]
+    async fn search_signals(
+        &self,
+        Parameters(args): Parameters<SearchSignalsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let limit = clamp_limit(args.limit);
+        let offset = args.offset.unwrap_or(0).min(MAX_HITS.saturating_sub(limit));
+        let since = match parse_time(args.since.as_deref()) {
+            Ok(t) => t.unwrap_or_else(|| now_ts() - 30 * 86_400),
+            Err(e) => return Ok(user_error(e)),
+        };
+        let until = match parse_time(args.until.as_deref()) {
+            Ok(t) => t,
+            Err(e) => return Ok(user_error(e)),
+        };
+
+        let mut f = Filter::default();
+        f.gte("occurred_at", since);
+        if let Some(u) = until {
+            f.lte("occurred_at", u);
+        }
+        if let Some(k) = args.kinds.as_deref() {
+            match parse_kinds(k) {
+                Ok(k) => f.any_of("kind", &k),
+                Err(e) => return Ok(user_error(e)),
             };
-        let mut top: Vec<(String, usize)> = categories.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        top.truncate(40);
-
-        let mut freshness = serde_json::Map::new();
-        for index in regional_core::index::CONTENT_INDEXES {
-            let ts = search::newest_update(&st.client, index)
-                .await
-                .ok()
-                .flatten();
-            freshness.insert(index.to_string(), json!(ts.and_then(search::fmt_ts)));
+        }
+        if let Some(v) = args.verticals.as_deref() {
+            match self.verticals(v) {
+                Ok(slugs) => f.any_of("verticals", &slugs),
+                Err(e) => return Ok(user_error(e)),
+            };
+        }
+        if let Some(r) = &args.roles {
+            let lower: Vec<String> = r.iter().map(|x| x.trim().to_lowercase()).collect();
+            f.any_of("roles", &lower);
+        }
+        if let Some(key) = args.company.as_deref() {
+            match self.company(key).await {
+                Ok(c) => f.eq("company_id", &c.id),
+                Err(r) => return Ok(r),
+            };
         }
 
-        let value = json!({
-            "region": region.name,
-            "slug": region.slug,
-            "admin_level": region.admin_level,
-            "timezone": region.timezone,
-            "bounding_box": {
-                "min_lat": region.bbox.min_lat,
-                "min_lng": region.bbox.min_lng,
-                "max_lat": region.bbox.max_lat,
-                "max_lng": region.bbox.max_lng,
+        let query = args.query.clone().unwrap_or_default();
+        let page: Page<Signal> = match st
+            .search(
+                SIGNALS,
+                &query,
+                &f.build(),
+                &["occurred_at:desc"],
+                None,
+                limit,
+                offset,
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return Ok(backend_error("search_signals", e)),
+        };
+        let mut text = header("signal", page.hits.len(), page.estimated_total, offset);
+        for (i, s) in page.hits.iter().enumerate() {
+            text.push_str(&format!(
+                "{}. {}\n",
+                i + 1 + offset,
+                render::signal_line(s, true)
+            ));
+        }
+        if page.hits.is_empty() {
+            text.push_str("Nothing matched. Widen `since`, drop a filter, or check describe_market for signal volume.");
+        }
+        Ok(respond(
+            text,
+            json!({
+                "estimated_total": page.estimated_total,
+                "offset": offset,
+                "results": page.hits.iter().map(signal_json).collect::<Vec<_>>(),
+            }),
+        ))
+    }
+
+    #[tool(
+        name = "update_account",
+        description = "Set our pipeline state for a company: status, owner, next step and when, tags, the profile it was qualified against, or a disqualification reason (required when disqualifying). Creates the account if there is none. A status change is recorded in the activity log with `note` as the reason. Only the fields you pass change."
+    )]
+    async fn update_account(
+        &self,
+        Parameters(args): Parameters<UpdateAccountArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let actor = actor(&parts);
+        let c = match self.company(&args.company).await {
+            Ok(c) => c,
+            Err(r) => return Ok(r),
+        };
+        let mut account = match st.account(&c.id).await {
+            Ok(a) => a.unwrap_or_else(|| new_account(&c, &actor)),
+            Err(e) => return Ok(backend_error("update_account", e)),
+        };
+        let before = account.status;
+
+        if let Some(s) = args.status.as_deref() {
+            match AccountStatus::parse(s) {
+                Some(s) => account.status = s,
+                None => {
+                    return Ok(user_error(format!(
+                        "unknown status {s:?}; use one of: {}",
+                        status_names()
+                    )));
+                }
+            }
+        }
+        if let Some(v) = args.owner {
+            account.owner = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = args.next_step {
+            account.next_step = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = args.next_touch_at.as_deref() {
+            match parse_time(Some(v)) {
+                Ok(t) => account.next_touch_at = t,
+                Err(e) => return Ok(user_error(e)),
+            }
+        }
+        if let Some(v) = args.disqualify_reason {
+            account.disqualify_reason = Some(v).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(p) = args.fit_profile.as_deref() {
+            match st.market.resolve_profile(p) {
+                Some(p) => account.fit_profile = Some(p.slug.clone()),
+                None => return Ok(user_error(self.no_profile(p))),
+            }
+        }
+        if let Some(t) = args.tags {
+            account.tags = t
+                .into_iter()
+                .map(|x| x.trim().to_lowercase())
+                .filter(|x| !x.is_empty())
+                .collect();
+            account.tags.dedup();
+        }
+        if account.status == AccountStatus::Disqualified && account.disqualify_reason.is_none() {
+            return Ok(user_error(
+                "disqualifying needs a `disqualify_reason`, so nobody re-prospects this company without knowing why".into(),
+            ));
+        }
+        if account.status != AccountStatus::Disqualified {
+            account.disqualify_reason = None;
+        }
+
+        let now = now_ts();
+        account.updated_at = now;
+        account.updated_by = actor.clone();
+        let mut log = Vec::new();
+        if account.status != before {
+            log.push(status_change(
+                &account,
+                before,
+                args.note.as_deref(),
+                &actor,
+                now,
+            ));
+        }
+        if let Err(e) = st.write_account(&account).await {
+            return Ok(backend_error("update_account", e));
+        }
+        if !log.is_empty()
+            && let Err(e) = st.write_activities(&log).await
+        {
+            return Ok(backend_error("update_account", e));
+        }
+
+        let mut text = format!("{} — ", c.name);
+        if account.status != before {
+            text.push_str(&format!("status {before} → {}\n", account.status));
+        } else {
+            text.push_str("updated\n");
+        }
+        text.push_str(&render::account_block(&account));
+        Ok(respond(text, json!({ "account": account })))
+    }
+
+    #[tool(
+        name = "log_activity",
+        description = "Record an outreach touch or note against a company: an email, call, LinkedIn message or meeting, or a research note. Creates the account if needed, and moves its status forward when the touch implies it: outbound email/call/linkedin → contacted, an inbound reply → engaged, a meeting → meeting. It never moves an account backwards or out of qualified/disqualified; use update_account for that."
+    )]
+    async fn log_activity(
+        &self,
+        Parameters(args): Parameters<LogActivityArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let actor = actor(&parts);
+        let Some(kind) =
+            ActivityType::parse(&args.activity_type).filter(|t| *t != ActivityType::StatusChange)
+        else {
+            return Ok(user_error(format!(
+                "unknown type {:?}; use email, call, linkedin, meeting or note",
+                args.activity_type
+            )));
+        };
+        let direction = match args.direction.as_deref().map(|d| d.trim().to_lowercase()) {
+            Some(d) if d == "inbound" || d == "outbound" => Some(d),
+            Some(d) if d.is_empty() => None,
+            Some(d) => {
+                return Ok(user_error(format!(
+                    "direction {d:?} must be inbound or outbound"
+                )));
+            }
+            None if matches!(
+                kind,
+                ActivityType::Email | ActivityType::Call | ActivityType::Linkedin
+            ) =>
+            {
+                Some("outbound".to_string())
+            }
+            None => None,
+        };
+        if args.summary.trim().is_empty() {
+            return Ok(user_error("`summary` must say what happened".into()));
+        }
+        let now = now_ts();
+        let occurred_at = match parse_time(args.occurred_at.as_deref()) {
+            Ok(t) => t.unwrap_or(now),
+            Err(e) => return Ok(user_error(e)),
+        };
+        let c = match self.company(&args.company).await {
+            Ok(c) => c,
+            Err(r) => return Ok(r),
+        };
+        let (mut account, created) = match st.account(&c.id).await {
+            Ok(Some(a)) => (a, false),
+            Ok(None) => {
+                let mut a = new_account(&c, &actor);
+                a.status = AccountStatus::Researching;
+                (a, true)
+            }
+            Err(e) => return Ok(backend_error("log_activity", e)),
+        };
+        let before = if created {
+            AccountStatus::New
+        } else {
+            account.status
+        };
+
+        let activity = Activity {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            account_id: c.id.clone(),
+            company_name: c.name.clone(),
+            activity_type: kind,
+            direction: direction.clone(),
+            subject: args.subject.filter(|s| !s.trim().is_empty()),
+            summary: args.summary.trim().to_string(),
+            outcome: args
+                .outcome
+                .map(|o| o.trim().to_lowercase())
+                .filter(|o| !o.is_empty()),
+            occurred_at,
+            actor: actor.clone(),
+            created_at: now,
+        };
+        if let Some(next) = advance(account.status, kind, direction.as_deref()) {
+            account.status = next;
+        }
+        account.last_activity_at = Some(account.last_activity_at.unwrap_or(0).max(occurred_at));
+        account.updated_at = now;
+        account.updated_by = actor.clone();
+
+        let mut log = vec![activity.clone()];
+        if account.status != before {
+            log.push(status_change(
+                &account,
+                before,
+                Some(&format!("after {kind}")),
+                &actor,
+                now,
+            ));
+        }
+        if let Err(e) = st.write_account(&account).await {
+            return Ok(backend_error("log_activity", e));
+        }
+        if let Err(e) = st.write_activities(&log).await {
+            return Ok(backend_error("log_activity", e));
+        }
+
+        let mut text = format!(
+            "Logged on {}: {}\n",
+            c.name,
+            render::activity_line(&activity)
+        );
+        if account.status != before {
+            text.push_str(&format!("Status {before} → {}\n", account.status));
+        }
+        Ok(respond(
+            text,
+            json!({ "activity": activity, "account": account }),
+        ))
+    }
+
+    #[tool(
+        name = "add_company",
+        description = "Ask the indexer to add a company by its domain. It is stubbed within a minute or two and its website crawled on the indexer's next crawl pass, after which get_company shows what was found. Returns the id the company will have. If the company is already indexed, says so and returns its id instead."
+    )]
+    async fn add_company(
+        &self,
+        Parameters(args): Parameters<AddCompanyArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let st = &self.state;
+        let actor = actor(&parts);
+        let Some(domain) = root_domain(&args.domain) else {
+            return Ok(user_error(format!(
+                "{:?} is not a domain or website URL I can use; pass something like \"acme.com\"",
+                args.domain
+            )));
+        };
+        let id = company_id(Some(&domain), None, None).unwrap_or_default();
+        match st.resolve_company(&id).await {
+            Ok(Some(c)) => {
+                return Ok(respond(
+                    format!(
+                        "{} ({domain}) is already indexed as id={}. Use get_company.",
+                        c.name, c.id
+                    ),
+                    json!({ "status": "exists", "id": c.id }),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => return Ok(backend_error("add_company", e)),
+        }
+        match st.pending_request(&domain).await {
+            Ok(Some(r)) => {
+                return Ok(respond(
+                    format!(
+                        "{domain} was already requested by {} and is queued; it will be id={}.",
+                        r.requested_by, r.company_id
+                    ),
+                    json!({ "status": "queued", "id": r.company_id }),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => return Ok(backend_error("add_company", e)),
+        }
+        let verticals = match args.verticals.as_deref() {
+            Some(v) => match self.verticals(v) {
+                Ok(s) => s,
+                Err(e) => return Ok(user_error(e)),
             },
-            "centroid": { "lat": region.center().lat, "lng": region.center().lng },
-            "geo_filter": envelope,
-            "document_counts": counts,
-            "last_updated": freshness,
-            "resolvable_places": region.city_names(),
-            "top_place_categories": top
-                .iter()
-                .map(|(name, n)| json!({ "category": name, "count": n }))
-                .collect::<Vec<_>>(),
-        });
-        Ok(respond(render::region(&value), value))
+            None => Vec::new(),
+        };
+        let now = now_ts();
+        let req = CompanyRequest {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            status: RequestStatus::Pending,
+            domain: domain.clone(),
+            company_id: id.clone(),
+            name: args.name.filter(|n| !n.trim().is_empty()),
+            verticals,
+            note: args.note.filter(|n| !n.trim().is_empty()),
+            requested_by: actor,
+            requested_at: now,
+            updated_at: now,
+            apply_note: None,
+        };
+        if let Err(e) = st.write_request(&req).await {
+            return Ok(backend_error("add_company", e));
+        }
+        Ok(respond(
+            format!(
+                "Queued {domain}. It will be id={id}; expect a stub within a couple of minutes and site details after the next crawl pass."
+            ),
+            json!({ "status": "queued", "id": id, "request": req }),
+        ))
     }
 }
 
 #[tool_handler]
-impl ServerHandler for RegionalSearch {
+impl ServerHandler for CrmServer {
     fn get_info(&self) -> ServerConfig {
-        let r = &self.state.region;
+        let m = &self.state.market;
+        let verticals: Vec<&str> = m.verticals.iter().map(|v| v.slug.as_str()).collect();
+        let profiles: Vec<&str> = m.profiles.iter().map(|p| p.slug.as_str()).collect();
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                format!("regional-search-{}", r.slug),
+                format!("crm-{}", m.slug),
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "Search engine for content geographically located inside {region}. \
-                 Everything indexed — places, events and articles — has coordinates \
-                 inside the region, so results are always local to {region} and a \
-                 query about anywhere else will correctly return nothing.\n\n\
-                 Put the subject of the search in `query` and the location in `city` \
-                 or `near`; those resolve to real coordinates and filter on distance, \
-                 which finds things that a text match on the place name would miss. \
-                 Start with `describe_region` to see what is indexed and which \
-                 category values exist, and `list_locales` for the place names \
-                 `city` and `near` accept.",
-                region = r.name
+                "CRM for outbound prospecting ({name}). Companies are gathered from public \
+                 sources — SEC EDGAR, Wikidata, company websites, public job boards and trade \
+                 press — classified into industry verticals ({verticals}) and scored against \
+                 customer profiles ({profiles}). Only companies are tracked, never individual \
+                 people.\n\n\
+                 A typical loop: `find_prospects` with a profile to get ranked companies with \
+                 reasons; `get_company` for the dossier and recent signals to personalise \
+                 outreach; after reaching out, `log_activity` (which moves the account to \
+                 contacted); record decisions with `update_account` (next step, nurture date, \
+                 disqualify with a reason). `search_signals` finds timely triggers such as new \
+                 job postings or funding; `search_companies` filters by anything. If a company \
+                 you need is missing, `add_company` with its domain. Call `describe_market` \
+                 first to see what is indexed.",
+                name = m.name,
+                verticals = verticals.join(", "),
+                profiles = profiles.join(", "),
             ))
     }
 }
 
 // ------------------------------------------------------------------ helpers
 
+impl CrmServer {
+    /// Resolve a company or produce the error result to return.
+    async fn company(&self, key: &str) -> Result<Company, CallToolResult> {
+        match self.state.resolve_company(key).await {
+            Ok(Some(c)) => Ok(c),
+            Ok(None) => Err(user_error(format!(
+                "no company matches {key:?}. Pass an id from a result, a domain, or an exact name; search_companies finds partial names, and add_company queues a missing one."
+            ))),
+            Err(e) => Err(backend_error("company lookup", e)),
+        }
+    }
+
+    fn verticals(&self, names: &[String]) -> Result<Vec<String>, String> {
+        let m = &self.state.market;
+        names
+            .iter()
+            .filter(|n| !n.trim().is_empty())
+            .map(|n| {
+                m.resolve_vertical(n).map(|v| v.slug.clone()).ok_or_else(|| {
+                    format!(
+                        "unknown vertical {n:?}. Did you mean: {}? list_verticals shows them all.",
+                        m.suggest_verticals(n, 3).join(", ")
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn no_profile(&self, name: &str) -> String {
+        let m = &self.state.market;
+        format!(
+            "unknown profile {name:?}. Did you mean: {}? list_profiles shows them all.",
+            m.suggest_profiles(name, 3).join(", ")
+        )
+    }
+
+    /// Turn status filters into id filters. `Ok(Some(result))` is an early,
+    /// empty answer; `Err` is a bad status name.
+    async fn status_filter(
+        &self,
+        f: &mut Filter,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+    ) -> Result<Option<CallToolResult>, String> {
+        let st = &self.state;
+        let parse = |list: &[String]| -> Result<(Vec<String>, bool), String> {
+            let mut out = Vec::new();
+            let mut none = false;
+            for s in list {
+                if s.trim().eq_ignore_ascii_case("none") {
+                    none = true;
+                } else {
+                    let st = AccountStatus::parse(s).ok_or_else(|| {
+                        format!(
+                            "unknown status {s:?}; use one of: {}, or none",
+                            status_names()
+                        )
+                    })?;
+                    out.push(st.as_str().to_string());
+                }
+            }
+            Ok((out, none))
+        };
+        if let Some(inc) = include.filter(|l| !l.is_empty()) {
+            let (statuses, none) = parse(inc)?;
+            let mut sf = Filter::default();
+            sf.any_of("status", &statuses);
+            if none {
+                // "no account" plus any listed statuses: exclude everything
+                // else rather than include a bounded list.
+                let others: Vec<String> = AccountStatus::ALL
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .filter(|s| !statuses.contains(s))
+                    .collect();
+                let mut of = Filter::default();
+                of.any_of("status", &others);
+                let ids = st
+                    .account_ids(&of.build())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                f.none_of("id", &ids);
+            } else {
+                let ids = st
+                    .account_ids(&sf.build())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if ids.is_empty() {
+                    return Ok(Some(respond(
+                        format!("No account is in status {}.", statuses.join("/")),
+                        json!({ "results": [], "estimated_total": 0 }),
+                    )));
+                }
+                f.any_of("id", &ids);
+            }
+        }
+        if let Some(exc) = exclude.filter(|l| !l.is_empty()) {
+            let (statuses, _) = parse(exc)?;
+            let mut sf = Filter::default();
+            sf.any_of("status", &statuses);
+            let ids = st
+                .account_ids(&sf.build())
+                .await
+                .map_err(|e| e.to_string())?;
+            f.none_of("id", &ids);
+        }
+        Ok(None)
+    }
+}
+
+/// A profile's hard constraints: its verticals, its territory (or unknown),
+/// and its size range (or unknown). Soft preferences live in the score.
+fn apply_profile(f: &mut Filter, p: &crm_core::market::Profile) {
+    f.any_of("verticals", &p.verticals);
+    let countries: Vec<String> = p.countries.iter().map(|c| c.to_uppercase()).collect();
+    f.any_of_or_missing("hq_country", &countries);
+    f.any_of_or_missing("hq_state", &p.states);
+    match (p.employees.min, p.employees.max) {
+        (None, None) => {}
+        (min, max) => {
+            let mut range = Vec::new();
+            if let Some(m) = min {
+                range.push(format!("employees >= {m}"));
+            }
+            if let Some(m) = max {
+                range.push(format!("employees <= {m}"));
+            }
+            f.and(format!(
+                "(employees NOT EXISTS OR ({}))",
+                range.join(" AND ")
+            ));
+        }
+    }
+}
+
+/// How an account moves when an activity is logged. Only ever forward, and
+/// never out of a decision someone made on purpose.
+pub fn advance(
+    current: AccountStatus,
+    kind: ActivityType,
+    direction: Option<&str>,
+) -> Option<AccountStatus> {
+    use AccountStatus::*;
+    let rank = |s: AccountStatus| match s {
+        New | Nurture => 0,
+        Researching => 1,
+        Queued => 2,
+        Contacted => 3,
+        Engaged => 4,
+        Meeting => 5,
+        Qualified | Disqualified => 99,
+    };
+    let target = match (kind, direction) {
+        (ActivityType::Meeting, _) => Meeting,
+        (ActivityType::Email | ActivityType::Call | ActivityType::Linkedin, Some("inbound")) => {
+            Engaged
+        }
+        (ActivityType::Email | ActivityType::Call | ActivityType::Linkedin, _) => Contacted,
+        _ => return None,
+    };
+    (rank(target) > rank(current)).then_some(target)
+}
+
+fn new_account(c: &Company, actor: &str) -> Account {
+    let mut a = Account::new(&c.id, &c.name, actor);
+    a.domain = c.domain.clone();
+    a
+}
+
+fn status_change(
+    a: &Account,
+    before: AccountStatus,
+    note: Option<&str>,
+    actor: &str,
+    now: i64,
+) -> Activity {
+    let mut summary = format!("{before} → {}", a.status);
+    if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
+        summary.push_str(&format!(": {}", n.trim()));
+    }
+    if let Some(r) = &a.disqualify_reason
+        && a.status == AccountStatus::Disqualified
+    {
+        summary.push_str(&format!(" (reason: {r})"));
+    }
+    Activity {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        account_id: a.id.clone(),
+        company_name: a.company_name.clone(),
+        activity_type: ActivityType::StatusChange,
+        direction: None,
+        subject: None,
+        summary,
+        outcome: None,
+        occurred_at: now,
+        actor: actor.to_string(),
+        created_at: now,
+    }
+}
+
+fn actor(parts: &Parts) -> String {
+    parts
+        .extensions
+        .get::<Actor>()
+        .map(|a| a.0.clone())
+        .unwrap_or_else(|| Actor::ANONYMOUS.to_string())
+}
+
+fn status_names() -> String {
+    AccountStatus::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn company_json(c: &Company, account: Option<&Account>, fit: Option<&Fit>) -> Value {
+    let mut v = serde_json::to_value(c).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        for k in [
+            "body",
+            "content_hash",
+            "indexed_at",
+            "name_source",
+            "merged_into",
+        ] {
+            o.remove(k);
+        }
+        o.insert(
+            "last_signal".into(),
+            json!(render::fmt_ts_opt(c.last_signal_at)),
+        );
+        o.insert(
+            "account_status".into(),
+            json!(account.map(|a| a.status.as_str())),
+        );
+        if let Some(f) = fit {
+            o.insert("fit".into(), json!(f));
+        }
+    }
+    v
+}
+
+fn signal_json(s: &Signal) -> Value {
+    let mut v = serde_json::to_value(s).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        for k in ["content_hash", "indexed_at", "updated_at", "source_id"] {
+            o.remove(k);
+        }
+        o.insert("date".into(), json!(render::fmt_ts(s.occurred_at)));
+    }
+    v
+}
+
+fn header(noun: &str, shown: usize, total: usize, offset: usize) -> String {
+    let mut s = format!("{shown} {noun}(s)");
+    if total > shown + offset {
+        s.push_str(&format!(
+            " of about {total}; pass offset={} for more",
+            offset + shown
+        ));
+    }
+    s.push_str("\n\n");
+    s
+}
+
 fn clamp_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
-fn parse_kinds(raw: Option<&[String]>, default: &[Kind]) -> Result<Vec<Kind>, String> {
-    let Some(raw) = raw else {
-        return Ok(default.to_vec());
-    };
-    if raw.is_empty() {
-        return Ok(default.to_vec());
-    }
+fn parse_kinds(raw: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for k in raw {
-        match Kind::parse(k) {
-            Some(kind) if !out.contains(&kind) => out.push(kind),
-            Some(_) => {}
+        match SignalKind::parse(k) {
+            Some(kind) => {
+                let s = kind.as_str().to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
             None => {
                 return Err(format!(
-                    "unknown kind {k:?}; expected any of: place, event, article"
+                    "unknown signal kind {k:?}; use any of: hiring, funding, launch, leadership, filing, news"
                 ));
             }
         }
@@ -620,8 +1353,8 @@ fn parse_kinds(raw: Option<&[String]>, default: &[Kind]) -> Result<Vec<Kind>, St
     Ok(out)
 }
 
-/// Accept either an ISO-8601 datetime or a bare unix timestamp, because
-/// models reliably produce both.
+/// Accept either an ISO-8601 datetime, a bare date, or a unix timestamp,
+/// because models reliably produce all three.
 fn parse_time(raw: Option<&str>) -> Result<Option<i64>, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -632,22 +1365,12 @@ fn parse_time(raw: Option<&str>) -> Result<Option<i64>, String> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
         return Ok(Some(dt.timestamp()));
     }
-    // A bare date is a common and unambiguous shape; treat it as midnight UTC.
     if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return Ok(Some(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()));
     }
     Err(format!(
         "could not read {raw:?} as a time; use ISO-8601 (2026-07-04T00:00:00Z), a date (2026-07-04), or a unix timestamp"
     ))
-}
-
-fn shape(st: &AppState, raw: Vec<(crate::search::RawHit, Option<String>)>) -> Vec<Hit> {
-    raw.into_iter()
-        .map(|(r, snip)| {
-            let city = geo::label_city(st, &r);
-            to_hit(r, snip, city)
-        })
-        .collect()
 }
 
 /// A result the caller can act on: readable text plus the structured
@@ -665,15 +1388,16 @@ fn user_error(message: String) -> CallToolResult {
 }
 
 fn backend_error(tool: &str, e: anyhow::Error) -> CallToolResult {
-    tracing::error!(tool, error = %e, "search backend error");
+    tracing::error!(tool, error = %e, "backend error");
     CallToolResult::error(vec![ContentBlock::text(format!(
-        "the search backend failed while handling {tool}: {e}"
+        "the backend failed while handling {tool}: {e:#}"
     ))])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crm_core::market::MarketConfig;
 
     #[test]
     fn limit_is_clamped_to_a_sane_window() {
@@ -681,23 +1405,6 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(5)), 5);
         assert_eq!(clamp_limit(Some(10_000)), MAX_LIMIT);
-    }
-
-    #[test]
-    fn kinds_parse_with_defaults_and_dedupe() {
-        assert_eq!(
-            parse_kinds(None, &[Kind::Place]).unwrap(),
-            vec![Kind::Place]
-        );
-        assert_eq!(
-            parse_kinds(Some(&[]), &Kind::ALL).unwrap(),
-            Kind::ALL.to_vec()
-        );
-        assert_eq!(
-            parse_kinds(Some(&["place".into(), "places".into()]), &Kind::ALL).unwrap(),
-            vec![Kind::Place]
-        );
-        assert!(parse_kinds(Some(&["restaurant".into()]), &Kind::ALL).is_err());
     }
 
     #[test]
@@ -711,5 +1418,58 @@ mod tests {
         );
         assert_eq!(parse_time(Some("1970-01-02")).unwrap(), Some(86_400));
         assert!(parse_time(Some("next tuesday")).is_err());
+    }
+
+    #[test]
+    fn signal_kinds_parse_and_dedupe() {
+        assert_eq!(
+            parse_kinds(&["jobs".into(), "hiring".into(), "Funding".into()]).unwrap(),
+            vec!["hiring", "funding"]
+        );
+        assert!(parse_kinds(&["gossip".into()]).is_err());
+    }
+
+    #[test]
+    fn activities_only_move_accounts_forward() {
+        use AccountStatus::*;
+        let email = ActivityType::Email;
+        assert_eq!(advance(New, email, Some("outbound")), Some(Contacted));
+        assert_eq!(advance(Researching, email, None), Some(Contacted));
+        assert_eq!(advance(Contacted, email, Some("outbound")), None);
+        assert_eq!(advance(Contacted, email, Some("inbound")), Some(Engaged));
+        assert_eq!(advance(Engaged, ActivityType::Meeting, None), Some(Meeting));
+        assert_eq!(advance(Meeting, email, Some("inbound")), None);
+        assert_eq!(advance(Disqualified, ActivityType::Meeting, None), None);
+        assert_eq!(advance(Qualified, email, None), None);
+        assert_eq!(advance(Nurture, email, Some("outbound")), Some(Contacted));
+        assert_eq!(advance(New, ActivityType::Note, None), None);
+    }
+
+    #[test]
+    fn profiles_become_hard_filters_that_keep_unknowns() {
+        let m = MarketConfig::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../market.example.toml"
+        ))
+        .unwrap();
+        let mut f = Filter::new(LIVE);
+        apply_profile(&mut f, m.profile("mid-market-ops").unwrap());
+        assert_eq!(
+            f.build(),
+            r#"merged_into NOT EXISTS AND verticals IN ["craft-beverage", "food-manufacturing", "logistics"] AND (hq_country IN ["US"] OR hq_country NOT EXISTS) AND (employees NOT EXISTS OR (employees >= 50 AND employees <= 1000))"#
+        );
+    }
+
+    #[test]
+    fn status_changes_explain_themselves() {
+        let mut a = Account::new("c", "Acme", "bdr");
+        a.status = AccountStatus::Disqualified;
+        a.disqualify_reason = Some("too small".into());
+        let act = status_change(&a, AccountStatus::Contacted, Some("checked"), "bdr", 5);
+        assert_eq!(act.activity_type, ActivityType::StatusChange);
+        assert_eq!(
+            act.summary,
+            "contacted → disqualified: checked (reason: too small)"
+        );
     }
 }

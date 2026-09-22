@@ -10,9 +10,10 @@ use anyhow::{Context, Result, bail};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
-    /// Shared secret required on `Authorization: Bearer`. `None` only when
-    /// the operator explicitly opted out.
-    pub auth_token: Option<String>,
+    /// Accepted bearer tokens, each with the name recorded as the actor on
+    /// anything written with it. Empty only when the operator explicitly
+    /// opted out of auth.
+    pub tokens: Vec<(String, String)>,
     pub allow_anonymous: bool,
     /// Hostnames the Streamable HTTP transport will answer on.
     ///
@@ -37,29 +38,31 @@ impl Config {
             .parse()
             .with_context(|| format!("cannot parse bind address {host}:{port}"))?;
 
-        let auth_token = std::env::var("MCP_AUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        let tokens = parse_tokens(
+            std::env::var("MCP_TOKENS").ok().as_deref(),
+            std::env::var("MCP_AUTH_TOKEN").ok().as_deref(),
+        )?;
         let allow_anonymous = matches!(
             std::env::var("MCP_ALLOW_ANONYMOUS").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         );
 
-        // Fail closed. This endpoint is reachable from the internet once
-        // it is deployed, so an unset token must stop the server rather
-        // than quietly serve the whole index to anyone who finds it.
-        if auth_token.is_none() && !allow_anonymous {
+        // Fail closed. This endpoint can write to the CRM once it is
+        // deployed, so an unset token must stop the server rather than
+        // quietly hand the pipeline to anyone who finds it.
+        if tokens.is_empty() && !allow_anonymous {
             bail!(
-                "MCP_AUTH_TOKEN is not set. Set it to a shared secret, or set \
-                 MCP_ALLOW_ANONYMOUS=1 to deliberately serve this endpoint without auth."
+                "no MCP token is set. Set MCP_TOKENS=name:secret,... (or MCP_AUTH_TOKEN for a \
+                 single agent), or set MCP_ALLOW_ANONYMOUS=1 to deliberately serve this \
+                 endpoint without auth."
             );
         }
-        if auth_token.is_some() && allow_anonymous {
-            tracing::warn!("MCP_ALLOW_ANONYMOUS is set, so MCP_AUTH_TOKEN will not be enforced");
+        if !tokens.is_empty() && allow_anonymous {
+            tracing::warn!("MCP_ALLOW_ANONYMOUS is set, so MCP tokens will not be enforced");
         }
 
         // Comma-separated, `host` or `host:port`, e.g.
-        // `MCP_ALLOWED_HOSTS=regional-mcp.us2.heyo.work`.
+        // `MCP_ALLOWED_HOSTS=crm-mcp.us2.heyo.work`.
         let allowed_hosts: Vec<String> = std::env::var("MCP_ALLOWED_HOSTS")
             .unwrap_or_default()
             .split(',')
@@ -70,13 +73,59 @@ impl Config {
 
         Ok(Self {
             bind,
-            auth_token,
+            tokens,
             allow_anonymous,
             allowed_hosts,
         })
     }
 
     pub fn requires_auth(&self) -> bool {
-        !self.allow_anonymous && self.auth_token.is_some()
+        !self.allow_anonymous && !self.tokens.is_empty()
+    }
+}
+
+/// `MCP_TOKENS=bdr-agent:s3cret,sam:other` plus the older single
+/// `MCP_AUTH_TOKEN`, which is recorded as the actor `agent`.
+fn parse_tokens(list: Option<&str>, single: Option<&str>) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for entry in list
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let (name, secret) = entry
+            .split_once(':')
+            .with_context(|| "MCP_TOKENS entries must be name:secret".to_string())?;
+        let (name, secret) = (name.trim(), secret.trim());
+        if name.is_empty() || secret.is_empty() {
+            bail!("MCP_TOKENS has an entry with an empty name or secret");
+        }
+        out.push((name.to_string(), secret.to_string()));
+    }
+    if let Some(t) = single.map(str::trim).filter(|t| !t.is_empty()) {
+        out.push(("agent".to_string(), t.to_string()));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_parse_from_both_variables() {
+        let t = parse_tokens(Some("bdr:abc, sam:def"), Some("xyz")).unwrap();
+        assert_eq!(
+            t,
+            vec![
+                ("bdr".to_string(), "abc".to_string()),
+                ("sam".to_string(), "def".to_string()),
+                ("agent".to_string(), "xyz".to_string()),
+            ]
+        );
+        assert!(parse_tokens(Some("nocolon"), None).is_err());
+        assert!(parse_tokens(Some(":secret"), None).is_err());
+        assert!(parse_tokens(None, Some("  ")).unwrap().is_empty());
     }
 }

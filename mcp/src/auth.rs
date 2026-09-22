@@ -1,4 +1,4 @@
-//! Bearer-token gate for the MCP endpoint.
+//! Bearer-token gate for the MCP endpoint, and who is calling.
 
 use std::sync::Arc;
 
@@ -11,19 +11,31 @@ use subtle::ConstantTimeEq;
 
 use crate::config::Config;
 
-/// Reject anything under the MCP route without a valid bearer token.
+/// The name of the token a request authenticated with. Recorded as
+/// `updated_by` / `actor` on everything the request writes, so the activity
+/// log says which agent (or person) did what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor(pub String);
+
+impl Actor {
+    pub const ANONYMOUS: &'static str = "anonymous";
+}
+
+/// Reject anything under the MCP route without a valid bearer token, and
+/// tag the request with the token's name.
 ///
 /// `/healthz` is deliberately not behind this layer: heyo's `--health-path`
 /// probe has no credentials.
 pub async fn require_bearer(
     State(cfg): State<Arc<Config>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     if !cfg.requires_auth() {
+        req.extensions_mut()
+            .insert(Actor(Actor::ANONYMOUS.to_string()));
         return next.run(req).await;
     }
-    let expected = cfg.auth_token.as_deref().unwrap_or_default();
 
     let presented = req
         .headers()
@@ -33,15 +45,27 @@ pub async fn require_bearer(
         .map(str::trim)
         .unwrap_or_default();
 
-    if !token_matches(presented, expected) {
+    let Some(name) = match_token(presented, &cfg.tokens) else {
         tracing::warn!(path = %req.uri().path(), "rejected unauthenticated MCP request");
         return unauthorized();
-    }
+    };
+    req.extensions_mut().insert(Actor(name.to_string()));
     next.run(req).await
 }
 
-/// Constant-time comparison, so a caller cannot learn the token by timing
-/// how long a wrong guess takes to be rejected.
+/// The name of the token that matches, checking every one in constant time
+/// so a caller cannot learn which prefix is right, or which token exists,
+/// from how long a rejection takes.
+fn match_token<'a>(presented: &str, tokens: &'a [(String, String)]) -> Option<&'a str> {
+    let mut found = None;
+    for (name, secret) in tokens {
+        if token_matches(presented, secret) && found.is_none() {
+            found = Some(name.as_str());
+        }
+    }
+    found
+}
+
 fn token_matches(presented: &str, expected: &str) -> bool {
     if presented.is_empty() || expected.is_empty() {
         return false;
@@ -54,7 +78,7 @@ fn token_matches(presented: &str, expected: &str) -> bool {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer realm=\"regional-mcp\"")],
+        [(header::WWW_AUTHENTICATE, "Bearer realm=\"crm-mcp\"")],
         "missing or invalid bearer token",
     )
         .into_response()
@@ -72,5 +96,16 @@ mod tests {
         assert!(!token_matches("s3cretx", "s3cret"));
         assert!(!token_matches("", "s3cret"));
         assert!(!token_matches("s3cret", ""));
+    }
+
+    #[test]
+    fn the_matching_token_names_the_actor() {
+        let tokens = vec![
+            ("bdr".to_string(), "aaa".to_string()),
+            ("sam".to_string(), "bbb".to_string()),
+        ];
+        assert_eq!(match_token("bbb", &tokens), Some("sam"));
+        assert_eq!(match_token("aaa", &tokens), Some("bdr"));
+        assert_eq!(match_token("ccc", &tokens), None);
     }
 }

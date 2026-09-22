@@ -1,18 +1,18 @@
-//! Shared foundation for the regional search stack.
+//! Shared foundation for the CRM stack.
 //!
-//! Both binaries in this workspace depend on this crate, so the writer
-//! (`bot`) and the reader (`mcp`) cannot drift apart on the document
-//! schema or the index settings.
+//! Every binary in this workspace depends on this crate, so the writer
+//! (`bot`), the agent-facing server (`mcp`) and the dashboard cannot drift
+//! apart on the document schema or the index settings.
 
 pub mod error;
 pub mod id;
 pub mod index;
+pub mod market;
 pub mod meili;
 pub mod model;
-pub mod region;
-pub mod submission;
+pub mod request;
 
 pub use error::{Error, Result};
-pub use model::{Article, Doc, Event, GeoPoint, GeoPrecision, Kind, Place};
-pub use region::{BBox, City, RegionConfig};
-pub use submission::{Request, Status, Submission};
+pub use market::{MarketConfig, Profile, Vertical};
+pub use model::{Account, AccountStatus, Activity, ActivityType, Company, Doc, Signal, SignalKind};
+pub use request::{CompanyRequest, RequestStatus};

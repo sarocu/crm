@@ -1,34 +1,32 @@
-//! The operator dashboard.
+//! The operator dashboard: a read-only window onto what the indexer has
+//! found and what the BDR agent has done with it.
 //!
 //! Deliberately unauthenticated — the load balancer is expected to sit in
-//! front of this port. Everything that changes state lives here rather than
-//! on the public port, so "protect this port" is the whole access policy.
+//! front of this port. It writes nothing, so the worst an intruder learns is
+//! the pipeline.
 
 use std::sync::Arc;
 
-use axum::Form;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use crm_core::model::{AccountStatus, Company};
 use maud::{Markup, html};
-use regional_core::index::CONTENT_INDEXES;
-use regional_core::model::Kind;
-use regional_core::submission::{Request, Status, Submission};
 use serde::Deserialize;
 
 use crate::state::AppState;
-use crate::store::{BotHealth, Overview, PAGE_SIZE};
-use crate::views::{self, Nav, page, request_badge, status_badge};
+use crate::store::{BotHealth, PAGE_SIZE, is_id};
+use crate::views::{self, Nav, page, status_badge};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(overview))
-        .route("/submissions", get(submissions))
-        .route("/submissions/{id}", get(submission_detail))
-        .route("/submissions/{id}/review", post(review))
-        .route("/browse", get(browse))
+        .route("/accounts", get(accounts))
+        .route("/accounts/{id}", get(account_detail))
+        .route("/companies", get(companies))
+        .route("/requests", get(requests))
         .route("/healthz", get(crate::healthz))
         .with_state(state)
 }
@@ -37,20 +35,16 @@ fn nav(current: &'static str) -> Nav {
     Nav {
         items: vec![
             ("/", "Overview"),
-            ("/submissions", "Submissions"),
-            ("/browse", "Browse index"),
+            ("/accounts", "Pipeline"),
+            ("/companies", "Companies"),
+            ("/requests", "Requests"),
         ],
         current,
     }
 }
 
-/// The page title defaults to the nav entry; `shell_titled` overrides it.
-fn shell(state: &AppState, current: &'static str, body: Markup) -> Markup {
-    shell_titled(state, current, current, body)
-}
-
-fn shell_titled(state: &AppState, current: &'static str, title: &str, body: Markup) -> Markup {
-    let brand = format!("{} · index admin", state.store.region.name);
+fn shell(state: &AppState, current: &'static str, title: &str, body: Markup) -> Markup {
+    let brand = format!("{} · CRM", state.store.market.name);
     page(
         &brand,
         "/",
@@ -64,57 +58,66 @@ fn shell_titled(state: &AppState, current: &'static str, title: &str, body: Mark
 
 async fn overview(State(state): State<Arc<AppState>>) -> Markup {
     let o = state.store.overview().await;
-    let (recent, _) = state
-        .store
-        .list(Some(Status::Pending), None, "", 0)
-        .await
-        .unwrap_or_default();
+    let m = &state.store.market;
 
     shell(
         &state,
         "Overview",
+        "Overview",
         html! {
-            h1 { (state.store.region.name) }
+            h1 { (m.name) }
             p.lede {
-                "Everything indexed sits inside the region bounding box "
-                span.mono { (state.store.region.geo_filter()) } "."
+                (m.verticals.len()) " verticals, " (m.profiles.len()) " customer profiles. "
+                "Market data is gathered by the indexer; accounts and activity are written by the BDR agent over MCP."
             }
 
             .grid {
-                @for index in CONTENT_INDEXES {
+                @for (index, n) in &o.documents {
                     .card {
                         .k { (index) }
-                        .n { (o.documents.get(index).copied().unwrap_or(0)) }
+                        .n { (n.map(|n| n.to_string()).unwrap_or_else(|| "?".into())) }
                         .sub {
                             @match o.freshest.get(index).copied().flatten() {
                                 Some(t) => { "newest " (views::ago(t)) }
-                                None => { "nothing indexed yet" }
+                                None => { "nothing yet" }
                             }
                         }
                     }
                 }
                 .card {
-                    .k { "pending review" }
-                    a.n href="/submissions?status=pending" {
-                        (o.submissions.get("pending").copied().unwrap_or(0))
+                    .k { "requests queued" }
+                    a.n href="/requests" { (o.pending_requests) }
+                    .sub { "from add_company" }
+                }
+            }
+
+            h2 { "Pipeline" }
+            .chips {
+                @for (status, n) in &o.pipeline {
+                    a href={ "/accounts?status=" (status) } { (status) " · " (n) }
+                }
+            }
+
+            h2 { "Companies by vertical" }
+            .chips {
+                @for v in &m.verticals {
+                    a href={ "/companies?vertical=" (v.slug) } {
+                        (v.name) " · " (o.by_vertical.get(&v.slug).copied().unwrap_or(0))
                     }
-                    .sub {
-                        (o.submissions.get("approved").copied().unwrap_or(0)) " approved · "
-                        (o.submissions.get("applied").copied().unwrap_or(0)) " applied"
+                }
+            }
+
+            @if !o.signals_30d.is_empty() {
+                h2 { "Signals in the last 30 days" }
+                .chips {
+                    @for (kind, n) in &o.signals_30d {
+                        span."badge"."plain" { (kind) " · " (n) }
                     }
                 }
             }
 
             h2 { "Indexer" }
             (indexer_panel(o.bot.as_ref()))
-
-            @if !recent.is_empty() {
-                h2 { "Waiting for review" }
-                (submission_table(&recent))
-                p.small { a href="/submissions?status=pending" { "All pending →" } }
-            }
-
-            (categories_panel(&o))
         },
     )
 }
@@ -152,7 +155,8 @@ fn indexer_panel(bot: Option<&BotHealth>) -> Markup {
                         th { "Runs" }
                         th { "Written" }
                         th { "Unchanged" }
-                        th { "Rejected" }
+                        th { "Merged" }
+                        th { "Dropped" }
                         th { "State" }
                     }
                 }
@@ -169,20 +173,21 @@ fn indexer_panel(bot: Option<&BotHealth>) -> Markup {
                             td { (s.runs) }
                             td { (s.totals.written) }
                             td { (s.totals.unchanged) }
+                            td { (s.totals.merged) }
                             td {
-                                // Out-of-region and malformed documents are
-                                // dropped on purpose; a rising count here is
-                                // usually a mapping bug, not a source problem.
-                                (s.totals.out_of_region + s.totals.invalid)
+                                // Signals for companies we have no record of,
+                                // and malformed records. A rising count here
+                                // is usually a mapping bug.
+                                (s.totals.orphaned + s.totals.invalid)
                             }
                             td {
                                 @if let Some(err) = &s.last_error {
-                                    span."badge"."pending" { "failing" }
+                                    span."badge"."warn" { "failing" }
                                     div.small.muted { (truncate(err, 140)) }
                                 } @else if s.consecutive_errors > 0 {
-                                    span."badge"."pending" { (views::plural(s.consecutive_errors as usize, "error")) }
+                                    span."badge"."warn" { (views::plural(s.consecutive_errors as usize, "error")) }
                                 } @else {
-                                    span."badge"."applied" { "ok" }
+                                    span."badge"."ok" { "ok" }
                                 }
                             }
                         }
@@ -198,114 +203,345 @@ fn indexer_panel(bot: Option<&BotHealth>) -> Markup {
     }
 }
 
-fn categories_panel(o: &Overview) -> Markup {
-    html! {
-        @if !o.top_categories.is_empty() {
-            h2 { "Most common place categories" }
-            p.small.muted {
-                "These are the live values callers can filter on. "
-                "A category that should exist and does not usually means a source mapping gap."
-            }
-            .chips {
-                @for (name, n) in &o.top_categories {
-                    a href={ "/browse?q=" (name) } { (name) " · " (n) }
-                }
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------ submissions
+// -------------------------------------------------------------- accounts
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
-    request: Option<String>,
+    vertical: Option<String>,
     #[serde(default)]
     q: Option<String>,
     #[serde(default)]
     offset: Option<usize>,
 }
 
-async fn submissions(State(state): State<Arc<AppState>>, Query(query): Query<ListQuery>) -> Markup {
-    let status = query.status.as_deref().and_then(Status::parse);
-    let request = query.request.as_deref().and_then(Request::parse);
+async fn accounts(State(state): State<Arc<AppState>>, Query(query): Query<ListQuery>) -> Markup {
+    let status = query.status.as_deref().and_then(AccountStatus::parse);
     let q = query.q.clone().unwrap_or_default();
     let offset = query.offset.unwrap_or(0);
-
-    let counts = state.store.submission_counts().await;
     let (rows, total) = state
         .store
-        .list(status, request, &q, offset)
+        .accounts(status, &q, offset)
         .await
         .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "listing submissions failed");
+            tracing::error!(error = %e, "listing accounts failed");
             (Vec::new(), 0)
         });
 
-    let link = |s: Option<Status>| match s {
-        Some(s) => format!("/submissions?status={}", s.as_str()),
-        None => "/submissions".to_string(),
+    let link = |s: Option<AccountStatus>| match s {
+        Some(s) => format!("/accounts?status={}", s.as_str()),
+        None => "/accounts".to_string(),
     };
 
     shell(
         &state,
-        "Submissions",
+        "Pipeline",
+        "Pipeline",
         html! {
-            h1 { "Submissions" }
-            p.lede { "Requests from the public form. Nothing reaches the index until it is approved here." }
-
+            h1 { "Pipeline" }
+            p.lede { "Every company the agent has touched, most recently updated first." }
             .chips {
                 @if status.is_none() {
                     a href=(link(None)) aria-current="page" { "All" }
                 } @else {
                     a href=(link(None)) { "All" }
                 }
-                @for s in Status::ALL {
-                    @let n = counts.get(s.as_str()).copied().unwrap_or(0);
+                @for s in AccountStatus::ALL {
                     @if status == Some(s) {
-                        a href=(link(Some(s))) aria-current="page" { (s.as_str()) " · " (n) }
+                        a href=(link(Some(s))) aria-current="page" { (s.as_str()) }
                     } @else {
-                        a href=(link(Some(s))) { (s.as_str()) " · " (n) }
+                        a href=(link(Some(s))) { (s.as_str()) }
                     }
                 }
             }
-
-            form method="get" action="/submissions" style="margin-bottom:18px" {
-                @if let Some(s) = status { input type="hidden" name="status" value=(s.as_str()); }
-                .actions {
-                    input type="text" name="q" value=(q) placeholder="Search submissions…"
-                        style="max-width:24rem";
-                    button.secondary type="submit" { "Search" }
-                }
-            }
-
+            (search_form("/accounts", "Search accounts…", &q, query.status.as_deref().map(|s| ("status", s))))
             @if rows.is_empty() {
-                .note {
-                    @if q.is_empty() { "Nothing here." }
-                    @else { "Nothing matched " span.mono { (q) } "." }
-                }
+                .note { "Nothing here yet." }
             } @else {
-                (submission_table(&rows))
-                (pager(&query, offset, rows.len(), total))
+                table {
+                    thead { tr {
+                        th { "Company" } th { "Status" } th { "Next step" }
+                        th.nowrap { "Next touch" } th { "Owner" } th.nowrap { "Updated" }
+                    } }
+                    tbody {
+                        @for a in &rows {
+                            tr {
+                                td {
+                                    a href={ "/accounts/" (a.id) } { (a.company_name) }
+                                    @if let Some(d) = &a.domain { div.small.muted { (d) } }
+                                }
+                                td { (status_badge(a.status)) }
+                                td { (a.next_step.clone().unwrap_or_default()) }
+                                td.nowrap { (views::opt_ts(a.next_touch_at)) }
+                                td { (a.owner.clone().unwrap_or_default()) }
+                                td.nowrap { (views::ago(a.updated_at)) div.small.muted { (a.updated_by) } }
+                            }
+                        }
+                    }
+                }
+                (pager("/accounts", &query, offset, rows.len(), total))
             }
         },
     )
 }
 
-fn pager(q: &ListQuery, offset: usize, shown: usize, total: usize) -> Markup {
+async fn account_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !is_id(&id) {
+        return (StatusCode::NOT_FOUND, "no such company").into_response();
+    }
+    let Some(d) = state.store.dossier(&id).await else {
+        return (StatusCode::NOT_FOUND, "no such company").into_response();
+    };
+    let c = &d.company;
+    shell(
+        &state,
+        "Pipeline",
+        &c.name,
+        html! {
+            h1 { (c.name) }
+            p.lede { (c.description) }
+            (company_facts(c))
+
+            h2 { "Account" }
+            @match &d.account {
+                None => { .note { "No account yet — the agent has not worked this company." } }
+                Some(a) => {
+                    dl.facts {
+                        dt { "Status" } dd { (status_badge(a.status)) }
+                        @if let Some(o) = &a.owner { dt { "Owner" } dd { (o) } }
+                        @if let Some(n) = &a.next_step { dt { "Next step" } dd { (n) } }
+                        @if let Some(t) = a.next_touch_at { dt { "Next touch" } dd { (views::ts(t)) } }
+                        @if let Some(r) = &a.disqualify_reason { dt { "Disqualified" } dd { (r) } }
+                        @if let Some(p) = &a.fit_profile { dt { "Profile" } dd { (p) } }
+                        @if !a.tags.is_empty() { dt { "Tags" } dd { (a.tags.join(", ")) } }
+                        dt { "Updated" } dd { (views::ts(a.updated_at)) " by " (a.updated_by) }
+                    }
+                }
+            }
+
+            h2 { "Activity" }
+            @if d.activities.is_empty() {
+                p.muted { "None." }
+            } @else {
+                table {
+                    thead { tr { th.nowrap { "When" } th { "Type" } th { "What" } th { "Outcome" } th { "By" } } }
+                    tbody {
+                        @for a in &d.activities {
+                            tr {
+                                td.nowrap { (views::ts(a.occurred_at)) }
+                                td.nowrap {
+                                    (a.activity_type.as_str())
+                                    @if let Some(dir) = &a.direction { div.small.muted { (dir) } }
+                                }
+                                td {
+                                    @if let Some(s) = &a.subject { strong { (s) } br; }
+                                    (a.summary)
+                                }
+                                td { (a.outcome.clone().unwrap_or_default()) }
+                                td { (a.actor) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            h2 { "Signals" }
+            @if d.signals.is_empty() {
+                p.muted { "None found yet." }
+            } @else {
+                table {
+                    thead { tr { th.nowrap { "When" } th { "Kind" } th { "Signal" } th { "Source" } } }
+                    tbody {
+                        @for s in &d.signals {
+                            tr {
+                                td.nowrap { (views::ts(s.occurred_at)) }
+                                td { span."badge"."plain" { (s.kind.as_str()) } }
+                                td {
+                                    @match &s.url {
+                                        Some(u) => { a href=(u) rel="noopener noreferrer" { (s.title) } }
+                                        None => { (s.title) }
+                                    }
+                                    @if !s.roles.is_empty() { div.small.muted { (s.roles.join(", ")) } }
+                                }
+                                td { (s.source) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .into_response()
+}
+
+fn company_facts(c: &Company) -> Markup {
+    let hq: Vec<&str> = [
+        c.hq_city.as_deref(),
+        c.hq_state.as_deref(),
+        c.hq_country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    html! {
+        dl.facts {
+            @if let Some(w) = c.website.as_ref().or(c.domain.as_ref()) {
+                dt { "Website" } dd { a href=(website_href(w)) rel="noopener noreferrer" { (w) } }
+            }
+            @if !c.verticals.is_empty() { dt { "Verticals" } dd { (c.verticals.join(", ")) } }
+            @if !c.industries.is_empty() { dt { "Industries" } dd { (c.industries.join(", ")) } }
+            @if let Some(n) = c.employees { dt { "Employees" } dd { (n) } }
+            @if !hq.is_empty() { dt { "HQ" } dd { (hq.join(", ")) } }
+            @if let Some(y) = c.founded { dt { "Founded" } dd { (y) } }
+            @if let Some(t) = &c.ticker { dt { "Ticker" } dd { (t) } }
+            @if !c.tech.is_empty() { dt { "Tech" } dd { (c.tech.join(", ")) } }
+            @if let (Some(p), Some(s)) = (&c.ats_provider, &c.ats_slug) { dt { "Job board" } dd { (p) "/" (s) } }
+            dt { "Sources" } dd { (c.sources.join(", ")) }
+            dt { "Id" } dd.mono { (c.id) }
+        }
+    }
+}
+
+fn website_href(w: &str) -> String {
+    if w.starts_with("http://") || w.starts_with("https://") {
+        w.to_string()
+    } else {
+        format!("https://{w}")
+    }
+}
+
+// ------------------------------------------------------------- companies
+
+async fn companies(State(state): State<Arc<AppState>>, Query(query): Query<ListQuery>) -> Markup {
+    let q = query.q.clone().unwrap_or_default();
+    let offset = query.offset.unwrap_or(0);
+    let vertical = query.vertical.as_deref();
+    let (rows, total) = state
+        .store
+        .companies(vertical, &q, offset)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "listing companies failed");
+            (Vec::new(), 0)
+        });
+    let m = &state.store.market;
+
+    shell(
+        &state,
+        "Companies",
+        "Companies",
+        html! {
+            h1 { "Companies" }
+            p.lede { "Everything the indexer has found, most recently active first." }
+            .chips {
+                @if vertical.is_none() {
+                    a href="/companies" aria-current="page" { "All" }
+                } @else {
+                    a href="/companies" { "All" }
+                }
+                @for v in &m.verticals {
+                    @if vertical == Some(v.slug.as_str()) {
+                        a href={ "/companies?vertical=" (v.slug) } aria-current="page" { (v.name) }
+                    } @else {
+                        a href={ "/companies?vertical=" (v.slug) } { (v.name) }
+                    }
+                }
+            }
+            (search_form("/companies", "Search companies…", &q, vertical.map(|v| ("vertical", v))))
+            @if rows.is_empty() {
+                .note { "Nothing here yet." }
+            } @else {
+                table {
+                    thead { tr {
+                        th { "Company" } th { "Verticals" } th { "Employees" } th { "HQ" } th.nowrap { "Last signal" }
+                    } }
+                    tbody {
+                        @for c in &rows {
+                            tr {
+                                td {
+                                    a href={ "/accounts/" (c.id) } { (c.name) }
+                                    @if let Some(d) = &c.domain { div.small.muted { (d) } }
+                                }
+                                td { (c.verticals.join(", ")) }
+                                td { (c.employees.map(|n| n.to_string()).unwrap_or_default()) }
+                                td { (c.hq_state.clone().or_else(|| c.hq_country.clone()).unwrap_or_default()) }
+                                td.nowrap { (c.last_signal_at.map(views::ago).unwrap_or_default()) }
+                            }
+                        }
+                    }
+                }
+                (pager("/companies", &query, offset, rows.len(), total))
+            }
+        },
+    )
+}
+
+// -------------------------------------------------------------- requests
+
+async fn requests(State(state): State<Arc<AppState>>) -> Markup {
+    let rows = state.store.requests().await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "listing requests failed");
+        Vec::new()
+    });
+    shell(
+        &state,
+        "Requests",
+        "Requests",
+        html! {
+            h1 { "Company requests" }
+            p.lede { "Companies the agent asked to add with add_company. The indexer stubs each one and queues its site for crawling." }
+            @if rows.is_empty() {
+                .note { "No requests yet." }
+            } @else {
+                table {
+                    thead { tr { th { "Domain" } th { "Status" } th { "By" } th.nowrap { "When" } th { "Note" } } }
+                    tbody {
+                        @for r in &rows {
+                            tr {
+                                td { a href={ "/accounts/" (r.company_id) } { (r.domain) } }
+                                td { span class={ "badge " (views::request_class(r.status)) } { (r.status.as_str()) } }
+                                td { (r.requested_by) }
+                                td.nowrap { (views::ago(r.requested_at)) }
+                                td {
+                                    @if let Some(n) = &r.note { (n) }
+                                    @if let Some(n) = &r.apply_note { div.small.muted { (n) } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn search_form(action: &str, placeholder: &str, q: &str, keep: Option<(&str, &str)>) -> Markup {
+    html! {
+        form method="get" action=(action) style="margin-bottom:18px" {
+            @if let Some((k, v)) = keep { input type="hidden" name=(k) value=(v); }
+            .actions {
+                input type="text" name="q" value=(q) placeholder=(placeholder) style="max-width:24rem";
+                button.secondary type="submit" { "Search" }
+            }
+        }
+    }
+}
+
+fn pager(path: &str, q: &ListQuery, offset: usize, shown: usize, total: usize) -> Markup {
     let base = |off: usize| {
-        let mut s = format!("/submissions?offset={off}");
-        if let Some(v) = &q.status {
-            s.push_str(&format!("&status={v}"));
-        }
-        if let Some(v) = &q.request {
-            s.push_str(&format!("&request={v}"));
-        }
-        if let Some(v) = &q.q {
-            s.push_str(&format!("&q={v}"));
+        let mut s = format!("{path}?offset={off}");
+        for (k, v) in [
+            ("status", &q.status),
+            ("vertical", &q.vertical),
+            ("q", &q.q),
+        ] {
+            if let Some(v) = v {
+                s.push_str(&format!("&{k}={}", urlencode(v)));
+            }
         }
         s
     };
@@ -316,284 +552,23 @@ fn pager(q: &ListQuery, offset: usize, shown: usize, total: usize) -> Markup {
                 a href=(base(offset.saturating_sub(PAGE_SIZE))) { "← previous" }
                 " "
             }
-            @if offset + shown < total {
+            @if offset + shown < total && offset + PAGE_SIZE < 1000 {
                 a href=(base(offset + PAGE_SIZE)) { "next →" }
             }
         }
     }
 }
 
-fn submission_table(rows: &[Submission]) -> Markup {
-    html! {
-        table {
-            thead {
-                tr {
-                    th { "What" }
-                    th { "Request" }
-                    th { "Where" }
-                    th.nowrap { "Received" }
-                    th { "Status" }
-                }
-            }
-            tbody {
-                @for s in rows {
-                    tr {
-                        td {
-                            a href={ "/submissions/" (s.id) } { strong { (s.title) } }
-                            div.small.muted { (truncate(&s.description, 110)) }
-                        }
-                        td { (request_badge(s.request)) " " span.small.muted { (s.target_kind) } }
-                        td.small {
-                            @match &s.city {
-                                Some(c) => { (c) }
-                                None => { span.muted { "—" } }
-                            }
-                        }
-                        td.nowrap.small { (views::ago(s.submitted_at)) }
-                        td { (status_badge(s.status)) }
-                    }
-                }
-            }
-        }
-    }
+fn urlencode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-async fn submission_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some(s) = state.store.get(&id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            shell(
-                &state,
-                "Submissions",
-                html! {
-                    h1 { "No such submission" }
-                    p { a.btn.secondary href="/submissions" { "Back to the queue" } }
-                },
-            ),
-        )
-            .into_response();
-    };
-
-    // If the submitter gave an id, say whether it actually resolves before
-    // the reviewer goes looking for it.
-    let existing = match (&s.existing_id, Kind::parse(&s.target_kind)) {
-        (Some(id), Some(kind)) => Some((id.clone(), state.store.document_exists(kind, id).await)),
-        _ => None,
-    };
-
-    let body = html! {
-        p.small { a href="/submissions" { "← Queue" } }
-        h1 { (s.title) }
-        p.lede { (status_badge(s.status)) " " (request_badge(s.request)) " " span.muted { (s.target_kind) } }
-
-        @if let Some(note) = &s.apply_note {
-            .note.warn {
-                strong { "The indexer could not apply this. " } (note)
-            }
-        }
-
-        h2 { "What they said" }
-        .card { p style="white-space:pre-wrap;margin:0" { (s.description) } }
-
-        h2 { "Details" }
-        dl.facts {
-            dt { "Reference" }  dd.mono { (s.id) }
-            dt { "Received" }   dd { (views::ts(s.submitted_at)) " (" (views::ago(s.submitted_at)) ")" }
-            @if let Some(u) = &s.url {
-                dt { "Website" } dd { a href=(u) rel="nofollow noopener noreferrer" target="_blank" { (u) } }
-            }
-            @if let Some(a) = &s.address { dt { "Address" } dd { (a) } }
-            @if let Some(c) = &s.city { dt { "Town" } dd { (c) } }
-            @if s.has_coords() {
-                dt { "Coordinates" }
-                dd.mono { (s.lat.unwrap_or_default()) ", " (s.lng.unwrap_or_default()) }
-            } @else {
-                dt { "Coordinates" }
-                dd.muted {
-                    "none given — "
-                    @if s.url.is_some() { "the crawler will try the website" }
-                    @else if s.address.is_some() { "will be geocoded from the address" }
-                    @else if s.city.is_some() { "will fall back to the town centre" }
-                    @else { "there is nothing to place this by, so it cannot be indexed" }
-                }
-            }
-            @if !s.categories.is_empty() {
-                dt { "Categories" } dd { (s.categories.join(", ")) }
-            }
-            @if let Some((id, exists)) = &existing {
-                dt { "Existing entry" }
-                dd {
-                    span.mono { (id) } " "
-                    @if *exists { span."badge"."applied" { "found" } }
-                    @else { span."badge"."pending" { "no such document" } }
-                }
-            }
-            @if let Some(c) = &s.contact {
-                dt { "Contact" }
-                dd { (c) " " span.small.muted { "(private — never published)" } }
-            }
-            @if let Some(t) = s.reviewed_at { dt { "Reviewed" } dd { (views::ts(t)) } }
-            @if let Some(n) = &s.review_note { dt { "Review note" } dd { (n) } }
-        }
-
-        @if s.request.needs_existing() && s.existing_id.is_none() {
-            .note.warn {
-                "No entry id was given. Find the document in "
-                a href={ "/browse?q=" (s.title) } { "the index browser" }
-                " to confirm what this refers to."
-            }
-        }
-
-        h2 { "Decide" }
-        p.small.muted {
-            "Approving queues it for the indexer, which acts on it within one "
-            "cycle of the submissions source. The note is shown to the submitter."
-        }
-        form.stack method="post" action={ "/submissions/" (s.id) "/review" } {
-            div {
-                label for="note" { "Note to the submitter " span.opt { "— optional" } }
-                textarea id="note" name="note" style="min-height:70px"
-                    placeholder="Added, thanks. / We couldn't confirm this one." {
-                    @if let Some(n) = &s.review_note { (n) }
-                }
-            }
-            .actions {
-                button type="submit" name="decision" value="approve" { "Approve" }
-                button.secondary type="submit" name="decision" value="reject" { "Reject" }
-                @if !matches!(s.status, Status::Pending) {
-                    button.secondary type="submit" name="decision" value="pending" { "Back to pending" }
-                }
-            }
-        }
-    };
-    shell_titled(&state, "Submissions", &s.title, body).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReviewForm {
-    decision: String,
-    #[serde(default)]
-    note: String,
-}
-
-async fn review(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Form(form): Form<ReviewForm>,
-) -> Response {
-    let status = match form.decision.as_str() {
-        "approve" => Status::Approved,
-        "reject" => Status::Rejected,
-        "pending" => Status::Pending,
-        other => {
-            tracing::warn!(decision = other, "unknown review decision");
-            return (StatusCode::BAD_REQUEST, "unknown decision").into_response();
-        }
-    };
-
-    match state.store.review(&id, status, Some(form.note)).await {
-        Ok(s) => {
-            tracing::info!(id = %s.id, status = %s.status, "submission reviewed");
-            Redirect::to(&format!("/submissions/{id}")).into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, id = %id, "review failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not save: {e}"),
-            )
-                .into_response()
-        }
-    }
-}
-
-// ----------------------------------------------------------------- browse
-
-#[derive(Debug, Deserialize)]
-pub struct BrowseQuery {
-    #[serde(default)]
-    q: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-}
-
-async fn browse(State(state): State<Arc<AppState>>, Query(query): Query<BrowseQuery>) -> Markup {
-    let q = query.q.clone().unwrap_or_default();
-    let kind = query.kind.as_deref().and_then(Kind::parse);
-    let hits = if q.is_empty() {
-        Vec::new()
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
     } else {
-        state.store.browse(kind, &q).await.unwrap_or_default()
-    };
-
-    shell(
-        &state,
-        "Browse index",
-        html! {
-            h1 { "Browse the index" }
-            p.lede {
-                "Find a document and copy its id, which is what an edit request "
-                "needs to point at."
-            }
-
-            form method="get" action="/browse" style="margin-bottom:18px" {
-                .actions {
-                    input type="text" name="q" value=(q) placeholder="Search everything indexed…"
-                        style="max-width:26rem" autofocus;
-                    select name="kind" style="max-width:10rem" {
-                        option value="" selected[kind.is_none()] { "All kinds" }
-                        @for k in Kind::ALL {
-                            option value=(k.as_str()) selected[kind == Some(k)] { (k.as_str()) }
-                        }
-                    }
-                    button.secondary type="submit" { "Search" }
-                }
-            }
-
-            @if q.is_empty() {
-                .note { "Type something to search." }
-            } @else if hits.is_empty() {
-                .note { "Nothing matched " span.mono { (q) } "." }
-            } @else {
-                table {
-                    thead {
-                        tr { th { "Title" } th { "Kind" } th { "Where" } th { "Source" } th { "Id" } }
-                    }
-                    tbody {
-                        @for h in &hits {
-                            tr {
-                                td {
-                                    @match &h.url {
-                                        Some(u) => {
-                                            a href=(u) rel="nofollow noopener noreferrer" target="_blank" { (h.title) }
-                                        }
-                                        None => { (h.title) }
-                                    }
-                                    @if !h.categories.is_empty() {
-                                        div.small.muted { (h.categories.join(", ")) }
-                                    }
-                                }
-                                td.small { (h.kind) }
-                                td.small { (h.city.clone().unwrap_or_else(|| "—".into())) }
-                                td.small { (h.source) }
-                                td.mono { (h.id) }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.chars().count() <= max {
-        return s.to_string();
+        format!("{}…", s.chars().take(n).collect::<String>())
     }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -601,19 +576,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncation_is_char_safe_and_marks_the_cut() {
-        assert_eq!(truncate("  short  ", 20), "short");
-        let out = truncate(&"é".repeat(50), 10);
-        assert_eq!(out.chars().count(), 11);
-        assert!(out.ends_with('…'));
+    fn long_errors_are_truncated_on_a_char_boundary() {
+        assert_eq!(truncate("héllo", 3), "hél…");
+        assert_eq!(truncate("ok", 5), "ok");
     }
 
     #[test]
-    fn every_nav_entry_points_at_a_real_route() {
-        // The route table and the nav are edited separately; keep them honest.
-        let routes = ["/", "/submissions", "/browse"];
-        for (href, _) in nav("Overview").items {
-            assert!(routes.contains(&href), "{href} is not a route");
-        }
+    fn websites_link_absolutely() {
+        assert_eq!(website_href("acme.test"), "https://acme.test");
+        assert_eq!(website_href("http://acme.test/"), "http://acme.test/");
+    }
+
+    #[test]
+    fn pager_links_escape_the_query() {
+        let q = ListQuery {
+            status: None,
+            vertical: None,
+            q: Some("a&b".into()),
+            offset: None,
+        };
+        let out = pager("/companies", &q, 0, 50, 200).into_string();
+        assert!(out.contains("q=a%26b"), "{out}");
     }
 }

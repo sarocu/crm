@@ -1,8 +1,8 @@
 # Build from the repository root so the whole workspace is in context:
-#   docker build -f dashboard/Dockerfile -t regional-dashboard .
+#   docker build -f dashboard/Dockerfile -t crm-dashboard .
 #
-# Serve a different region by pointing at a different config at build time:
-#   docker build -f dashboard/Dockerfile --build-arg REGION_FILE=region.vermont.toml .
+# Serve a different market by pointing at a different config at build time:
+#   docker build -f dashboard/Dockerfile --build-arg MARKET_FILE=market.acme.toml .
 #
 # The resulting OCI image is also the heyo VM image: the
 # firecracker_containerd backend pulls ordinary registry references and
@@ -29,9 +29,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim
 
-# Which region this image serves. Any TOML in the build context will do; see
-# region.colorado.toml for the shape.
-ARG REGION_FILE=region.colorado.toml
+# Which market this image serves. Any TOML in the build context will do; see
+# market.example.toml for the shape.
+ARG MARKET_FILE=market.example.toml
 
 # `openssh-server` and `iproute2` are not optional in a Firecracker guest:
 # /init.sh brings eth0 up with `ip` from the kernel's `ip=` parameter, and sshd
@@ -41,7 +41,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl openssh-server iproute2 iputils-ping procps \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home regional
+    && useradd --system --uid 10001 --create-home crm
 
 # Host keys at build time so sshd does not block on entropy at first boot, and
 # the login policy written explicitly because there is no cloud-init to fix it
@@ -56,8 +56,8 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
 
 COPY --from=builder /usr/local/bin/dashboard /usr/local/bin/dashboard
 # Baked in, because heyo's firecracker_containerd backend takes no --mount.
-# REGION_CONFIG can still point elsewhere at runtime where a mount exists.
-COPY ${REGION_FILE} /etc/regional/region.toml
+# MARKET_CONFIG can still point elsewhere at runtime where a mount exists.
+COPY ${MARKET_FILE} /etc/crm/market.toml
 
 # PID 1 for the microVM. The kernel is booted with `init=/init.sh`, so an image
 # without this panics before userspace starts; see rootfs/init.sh. ENTRYPOINT
@@ -66,16 +66,15 @@ COPY ${REGION_FILE} /etc/regional/region.toml
 COPY rootfs/init.sh /init.sh
 RUN chmod +x /init.sh \
     && mkdir -p /etc/heyo \
-    && echo 'regional-dashboard' > /etc/heyo/hostname \
-    && echo 'regional-dashboard' > /etc/hostname
+    && echo 'crm-dashboard' > /etc/heyo/hostname \
+    && echo 'crm-dashboard' > /etc/hostname
 
-USER regional
+USER crm
 ENV ADMIN_PORT=8090 \
     BIND_HOST=0.0.0.0 \
-    PUBLIC_PORT=8091 \
-    REGION_CONFIG=/etc/regional/region.toml \
+    MARKET_CONFIG=/etc/crm/market.toml \
     RUST_LOG=info
-EXPOSE 8090 8091
+EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${ADMIN_PORT}/healthz" || exit 1

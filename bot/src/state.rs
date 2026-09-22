@@ -1,32 +1,32 @@
 //! Indexer bookkeeping, persisted in Meilisearch.
 //!
-//! Per-source cursors, the crawl frontier and the geocoding cache all live
-//! in the `bot_state` index. Meilisearch is the only stateful service in the
-//! stack, so keeping state here means the indexer needs no volume of its own
-//! and survives VM replacement — which matters on heyo, where the
-//! `firecracker_containerd` backend has no `--mount`.
+//! Per-source cursors and the crawl frontier live in the `bot_state` index.
+//! Meilisearch is the only stateful service in the stack, so keeping state
+//! here means the indexer needs no volume of its own and survives VM
+//! replacement.
 //!
 //! It is not a queue, and it is not pretending to be one: a single indexer
 //! owns the frontier, and claims are marked before work starts so a restart
 //! does not replay the same page forever.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use crm_core::id::stable_id;
+use crm_core::index::BOT_STATE;
+use crm_core::meili::{self, Client};
+use crm_core::model::now_ts;
 use meilisearch_sdk::search::{SearchQuery, Selectors};
-use regional_core::id::stable_id;
-use regional_core::index::BOT_STATE;
-use regional_core::meili::{self, Client};
-use regional_core::model::now_ts;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One row in `bot_state`. A single flat shape keeps the index settings
-/// simple; `kind` separates the three uses.
+/// simple; `kind` separates the uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateDoc {
     pub id: String,
-    /// `cursor`, `frontier` or `geocache`.
+    /// `cursor` or `frontier`.
     pub kind: String,
     #[serde(default)]
     pub source: String,
@@ -44,25 +44,39 @@ pub struct StateDoc {
     pub depth: Option<u32>,
     #[serde(default)]
     pub priority: Option<i64>,
+    /// The company whose site this page belongs to.
     #[serde(default)]
-    pub default_city: Option<String>,
+    pub company_id: Option<String>,
     #[serde(default)]
     pub discovered_at: Option<i64>,
 
-    // geocache
-    #[serde(default)]
-    pub lat: Option<f64>,
-    #[serde(default)]
-    pub lng: Option<f64>,
-
     pub updated_at: i64,
+}
+
+impl StateDoc {
+    fn empty(id: String, kind: &str) -> Self {
+        Self {
+            id,
+            kind: kind.into(),
+            source: String::new(),
+            value: None,
+            url: None,
+            host: None,
+            status: None,
+            depth: None,
+            priority: None,
+            company_id: None,
+            discovered_at: None,
+            updated_at: now_ts(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FrontierEntry {
     pub url: String,
     pub depth: u32,
-    pub default_city: Option<String>,
+    pub company_id: Option<String>,
 }
 
 pub struct BotState {
@@ -74,8 +88,7 @@ impl BotState {
         Self { client }
     }
 
-    /// The Meilisearch client, for the submissions source, which reads and
-    /// writes the submissions index rather than `bot_state`.
+    /// The Meilisearch client, for sources that read the market indexes.
     pub fn client(&self) -> &Client {
         &self.client
     }
@@ -95,22 +108,9 @@ impl BotState {
     }
 
     pub async fn set_cursor(&self, source: &str, value: Option<Value>) -> Result<()> {
-        let doc = StateDoc {
-            id: format!("cursor-{source}"),
-            kind: "cursor".into(),
-            source: source.into(),
-            value,
-            url: None,
-            host: None,
-            status: None,
-            depth: None,
-            priority: None,
-            default_city: None,
-            discovered_at: None,
-            lat: None,
-            lng: None,
-            updated_at: now_ts(),
-        };
+        let mut doc = StateDoc::empty(format!("cursor-{source}"), "cursor");
+        doc.source = source.into();
+        doc.value = value;
         meili::upsert_chunked(&self.client, BOT_STATE, &[doc]).await?;
         Ok(())
     }
@@ -127,30 +127,26 @@ impl BotState {
         let known = self.known_ids(&ids).await?;
 
         let now = now_ts();
-        let fresh: Vec<StateDoc> = entries
-            .iter()
-            .zip(&ids)
-            .filter(|(_, id)| !known.contains(*id))
-            .map(|(e, id)| StateDoc {
-                id: id.clone(),
-                kind: "frontier".into(),
-                source: "crawl".into(),
-                value: None,
-                url: Some(e.url.clone()),
-                host: crate::http::host_of(&e.url).ok(),
-                status: Some("pending".into()),
-                depth: Some(e.depth),
-                // Shallower pages first: a site's index pages are where the
-                // links are, so breadth-first expands coverage fastest.
-                priority: Some(e.depth as i64),
-                default_city: e.default_city.clone(),
-                discovered_at: Some(now),
-                lat: None,
-                lng: None,
-                updated_at: now,
-            })
-            .collect();
+        let mut fresh: HashMap<String, StateDoc> = HashMap::new();
+        for (e, id) in entries.iter().zip(&ids) {
+            if known.contains(id) || fresh.contains_key(id) {
+                continue;
+            }
+            let mut doc = StateDoc::empty(id.clone(), "frontier");
+            doc.source = "crawl".into();
+            doc.url = Some(e.url.clone());
+            doc.host = crate::http::host_of(&e.url).ok();
+            doc.status = Some("pending".into());
+            doc.depth = Some(e.depth);
+            // Homepages first: they carry the JSON-LD and the links to the
+            // about and careers pages everything else comes from.
+            doc.priority = Some(e.depth as i64);
+            doc.company_id = e.company_id.clone();
+            doc.discovered_at = Some(now);
+            fresh.insert(id.clone(), doc);
+        }
 
+        let fresh: Vec<StateDoc> = fresh.into_values().collect();
         let n = fresh.len();
         meili::upsert_chunked(&self.client, BOT_STATE, &fresh).await?;
         Ok(n)
@@ -175,7 +171,7 @@ impl BotState {
                 Some(FrontierEntry {
                     url: h.result.url.clone()?,
                     depth: h.result.depth.unwrap_or(0),
-                    default_city: h.result.default_city.clone(),
+                    company_id: h.result.company_id.clone(),
                 })
             })
             .collect();
@@ -218,133 +214,64 @@ impl BotState {
         }
     }
 
+    /// Put every visited homepage back in the pending pool, so a finished
+    /// pass starts another and changed sites are eventually re-read.
+    pub async fn frontier_reset_roots(&self) -> Result<usize> {
+        self.set_status_where(
+            "kind = \"frontier\" AND depth = 0 AND status != \"pending\" AND status != \"in_progress\"",
+            "pending",
+        )
+        .await
+    }
+
     /// Return anything claimed but never finished to the pending pool.
     /// Called once on startup, which is what makes a mid-crawl crash safe.
     pub async fn frontier_requeue_stale(&self) -> Result<usize> {
-        let idx = self.index();
-        let mut q = SearchQuery::new(&idx);
-        q.with_query("")
-            .with_filter("kind = \"frontier\" AND status = \"in_progress\"")
-            .with_limit(1000);
-        let res = q.execute::<StateDoc>().await?;
-        let requeued: Vec<StateDoc> = res
-            .hits
-            .into_iter()
-            .map(|h| StateDoc {
-                status: Some("pending".into()),
-                updated_at: now_ts(),
-                ..h.result
-            })
-            .collect();
-        let n = requeued.len();
+        let n = self
+            .set_status_where(
+                "kind = \"frontier\" AND status = \"in_progress\"",
+                "pending",
+            )
+            .await?;
         if n > 0 {
-            meili::upsert_chunked(&self.client, BOT_STATE, &requeued).await?;
             tracing::info!(n, "requeued crawl URLs left in progress by a previous run");
         }
         Ok(n)
     }
 
-    // ----------------------------------------------------------- suppression
-
-    /// Mark a document as one that must never be indexed again.
-    ///
-    /// Deleting a document is not enough on its own: the source that
-    /// produced it still has it, so the next sweep would put it straight
-    /// back. An approved removal has to be remembered.
-    pub async fn suppress(&self, doc_id: &str, reason: &str) -> Result<()> {
-        let doc = StateDoc {
-            id: suppression_id(doc_id),
-            kind: "suppression".into(),
-            source: "submissions".into(),
-            value: Some(Value::String(doc_id.to_string())),
-            url: None,
-            host: None,
-            status: Some("suppressed".into()),
-            depth: None,
-            priority: None,
-            default_city: Some(reason.chars().take(200).collect()),
-            discovered_at: None,
-            lat: None,
-            lng: None,
-            updated_at: now_ts(),
-        };
-        meili::upsert_chunked(&self.client, BOT_STATE, &[doc]).await?;
-        Ok(())
-    }
-
-    /// Which of these document ids are suppressed.
-    pub async fn suppressed(
-        &self,
-        doc_ids: &[String],
-    ) -> Result<std::collections::HashSet<String>> {
-        if doc_ids.is_empty() {
-            return Ok(Default::default());
+    async fn set_status_where(&self, filter: &str, status: &str) -> Result<usize> {
+        let idx = self.index();
+        let mut total = 0;
+        loop {
+            let mut q = SearchQuery::new(&idx);
+            q.with_query("").with_filter(filter).with_limit(1000);
+            let res = q.execute::<StateDoc>().await?;
+            if res.hits.is_empty() {
+                return Ok(total);
+            }
+            let batch: Vec<StateDoc> = res
+                .hits
+                .into_iter()
+                .map(|h| StateDoc {
+                    status: Some(status.into()),
+                    updated_at: now_ts(),
+                    ..h.result
+                })
+                .collect();
+            total += batch.len();
+            let full = batch.len() == 1000;
+            meili::upsert_chunked(&self.client, BOT_STATE, &batch).await?;
+            if !full {
+                return Ok(total);
+            }
         }
-        let keys: Vec<String> = doc_ids.iter().map(|d| suppression_id(d)).collect();
-        let known = self.known_ids(&keys).await?;
-        Ok(doc_ids
-            .iter()
-            .filter(|d| known.contains(&suppression_id(d)))
-            .cloned()
-            .collect())
-    }
-
-    // ------------------------------------------------------------ geocache
-
-    pub async fn geocache_get(&self, key: &str) -> Option<(f64, f64)> {
-        let id = geocache_id(key);
-        let doc = self.index().get_document::<StateDoc>(&id).await.ok()?;
-        Some((doc.lat?, doc.lng?))
-    }
-
-    pub async fn geocache_put(&self, key: &str, coords: Option<(f64, f64)>) -> Result<()> {
-        // A miss is cached too: re-asking Nominatim for an address it could
-        // not resolve wastes the one request per second we are allowed.
-        let doc = StateDoc {
-            id: geocache_id(key),
-            kind: "geocache".into(),
-            source: "nominatim".into(),
-            value: Some(Value::String(key.to_string())),
-            url: None,
-            host: None,
-            status: Some(if coords.is_some() { "hit" } else { "miss" }.into()),
-            depth: None,
-            priority: None,
-            default_city: None,
-            discovered_at: None,
-            lat: coords.map(|c| c.0),
-            lng: coords.map(|c| c.1),
-            updated_at: now_ts(),
-        };
-        meili::upsert_chunked(&self.client, BOT_STATE, &[doc]).await?;
-        Ok(())
-    }
-
-    /// True when we have already asked about this key, hit or miss.
-    pub async fn geocache_known(&self, key: &str) -> bool {
-        self.index()
-            .get_document::<StateDoc>(&geocache_id(key))
-            .await
-            .is_ok()
     }
 
     // --------------------------------------------------------------- utils
 
-    async fn known_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
-        let mut out = std::collections::HashSet::new();
-        for chunk in ids.chunks(200) {
-            let filter = id_in_filter(chunk);
-            let idx = self.index();
-            let fields = ["id"];
-            let mut q = SearchQuery::new(&idx);
-            q.with_query("")
-                .with_filter(&filter)
-                .with_limit(chunk.len())
-                .with_attributes_to_retrieve(Selectors::Some(&fields));
-            let res = q.execute::<IdOnly>().await?;
-            out.extend(res.hits.into_iter().map(|h| h.result.id));
-        }
-        Ok(out)
+    async fn known_ids(&self, ids: &[String]) -> Result<HashSet<String>> {
+        let rows: Vec<IdOnly> = fetch_by_ids(&self.client, BOT_STATE, ids, Some(&["id"])).await?;
+        Ok(rows.into_iter().map(|r| r.id).collect())
     }
 }
 
@@ -357,21 +284,57 @@ pub fn frontier_id(url: &str) -> String {
     format!("f{}", stable_id("frontier", url))
 }
 
-/// Derived directly from the document id, so a batch of documents can be
-/// checked for suppression with one `id IN [...]` lookup.
-fn suppression_id(doc_id: &str) -> String {
-    format!("sup-{}", stable_id("suppression", doc_id))
+/// `field IN ["a", "b"]`, quoted and escaped.
+pub fn in_filter(field: &str, values: &[String]) -> String {
+    let quoted: Vec<String> = values
+        .iter()
+        .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("{field} IN [{}]", quoted.join(", "))
 }
 
-fn geocache_id(key: &str) -> String {
-    format!("g{}", stable_id("geocache", key))
+/// Fetch documents by id from any index, 200 at a time.
+pub async fn fetch_by_ids<T: DeserializeOwned + Send + Sync + 'static>(
+    client: &Client,
+    index: &str,
+    ids: &[String],
+    fields: Option<&[&str]>,
+) -> Result<Vec<T>> {
+    fetch_where(client, index, "id", ids, fields).await
 }
 
-/// `id IN ["a", "b"]`. Ids are hex from [`stable_id`], so no escaping is
-/// needed, but quoting keeps the expression well-formed regardless.
-pub fn id_in_filter(ids: &[String]) -> String {
-    let quoted: Vec<String> = ids.iter().map(|i| format!("\"{i}\"")).collect();
-    format!("id IN [{}]", quoted.join(", "))
+/// Fetch documents whose `field` is any of `values`, 200 values at a time.
+pub async fn fetch_where<T: DeserializeOwned + Send + Sync + 'static>(
+    client: &Client,
+    index: &str,
+    field: &str,
+    values: &[String],
+    fields: Option<&[&str]>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let idx = client.index(index);
+    for chunk in values.chunks(200) {
+        let filter = in_filter(field, chunk);
+        let mut offset = 0;
+        loop {
+            let mut q = SearchQuery::new(&idx);
+            q.with_query("")
+                .with_filter(&filter)
+                .with_limit(1000)
+                .with_offset(offset);
+            if let Some(f) = fields {
+                q.with_attributes_to_retrieve(Selectors::Some(f));
+            }
+            let res = q.execute::<T>().await?;
+            let n = res.hits.len();
+            out.extend(res.hits.into_iter().map(|h| h.result));
+            if n < 1000 {
+                break;
+            }
+            offset += n;
+        }
+    }
+    Ok(out)
 }
 
 /// Look up the `content_hash` already indexed for a batch of ids.
@@ -383,22 +346,9 @@ pub async fn existing_hashes(
     index: &str,
     ids: &[String],
 ) -> Result<HashMap<String, String>> {
-    let mut out = HashMap::new();
-    for chunk in ids.chunks(200) {
-        let filter = id_in_filter(chunk);
-        let idx = client.index(index);
-        let fields = ["id", "content_hash"];
-        let mut q = SearchQuery::new(&idx);
-        q.with_query("")
-            .with_filter(&filter)
-            .with_limit(chunk.len())
-            .with_attributes_to_retrieve(Selectors::Some(&fields));
-        let res = q.execute::<HashRow>().await?;
-        for hit in res.hits {
-            out.insert(hit.result.id, hit.result.content_hash);
-        }
-    }
-    Ok(out)
+    let rows: Vec<HashRow> =
+        fetch_by_ids(client, index, ids, Some(&["id", "content_hash"])).await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,19 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn suppression_ids_are_derived_and_key_safe() {
-        let a = suppression_id("63276ab7ed80a24f");
-        assert_eq!(a, suppression_id("63276ab7ed80a24f"));
-        assert_ne!(a, suppression_id("other"));
-        // Meilisearch primary keys allow only [a-zA-Z0-9_-].
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    }
-
-    #[test]
-    fn id_filters_are_well_formed() {
+    fn in_filters_are_well_formed_and_escaped() {
         assert_eq!(
-            id_in_filter(&["aa".into(), "bb".into()]),
+            in_filter("id", &["aa".into(), "bb".into()]),
             r#"id IN ["aa", "bb"]"#
         );
+        assert_eq!(in_filter("cik", &["a\"b".into()]), r#"cik IN ["a\"b"]"#);
     }
 }

@@ -8,7 +8,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-regional-core = { path = "core" }
+crm-core = { path = "core" }
 
 anyhow = "1.0"
 thiserror = "2.0"
@@ -24,4 +24,6 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+psl = "2.1"
+uuid = { version = "1.26", features = ["v4"] }
 axum = "0.8"

@@ -4,309 +4,357 @@
 //! a model actually reads. It is compact on purpose — every wasted line is
 //! context that could have held another result.
 
+use crm_core::market::{MarketConfig, Profile, Vertical};
+use crm_core::model::{Account, Activity, Company, Signal};
 use serde_json::Value;
 
-use crate::search::Hit;
+use crate::score::Fit;
 
-pub fn header(
-    region: &str,
-    subject: &str,
-    scope: Option<&str>,
-    shown: usize,
-    estimated_total: usize,
-    offset: usize,
+pub fn fmt_ts(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+pub fn fmt_ts_opt(ts: Option<i64>) -> Option<String> {
+    ts.map(fmt_ts)
+}
+
+/// "Denver, CO, US".
+pub fn hq(c: &Company) -> Option<String> {
+    let parts: Vec<&str> = [
+        c.hq_city.as_deref(),
+        c.hq_state.as_deref(),
+        c.hq_country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// One company as a list entry: name line, then a line of facts.
+pub fn company_entry(
+    i: usize,
+    c: &Company,
+    account: Option<&Account>,
+    fit: Option<&Fit>,
 ) -> String {
-    let mut s = format!("{shown} result(s) in {region} for {subject}");
-    if let Some(scope) = scope {
-        s.push_str(&format!(" {scope}"));
+    let mut out = format!("{}. {}", i + 1, c.name);
+    if let Some(d) = &c.domain {
+        out.push_str(&format!(" ({d})"));
     }
-    if estimated_total > shown + offset {
-        s.push_str(&format!(
-            " — about {estimated_total} match in total; pass offset={} for more",
-            offset + shown
-        ));
+    if let Some(f) = fit {
+        out.push_str(&format!(" — fit {}/100", f.score));
     }
-    s
-}
+    out.push_str(&format!("  id={}\n", c.id));
 
-/// Metres read better than "0.0 km" for anything close by.
-fn distance(metres: u64) -> String {
-    if metres < 1_000 {
-        format!("{metres} m")
-    } else {
-        format!("{:.1} km", metres as f64 / 1000.0)
+    let mut facts = Vec::new();
+    if !c.verticals.is_empty() {
+        facts.push(c.verticals.join(", "));
     }
-}
-
-pub fn hits(header: &str, hits: &[Hit]) -> String {
-    if hits.is_empty() {
-        return format!(
-            "{header}\n\nNothing matched. Try a broader `query`, a larger `radius_m`, \
-             or call describe_region to see which place names and categories exist."
-        );
+    if let Some(n) = c.employees {
+        facts.push(format!("{n} employees"));
     }
-    let mut out = String::from(header);
-    out.push_str("\n\n");
-    for (i, h) in hits.iter().enumerate() {
-        out.push_str(&format!("{}. {} [{}]", i + 1, h.title, h.kind));
-        let mut where_bits = Vec::new();
-        if let Some(city) = &h.city {
-            where_bits.push(city.clone());
-        }
-        if let Some(d) = h.distance_m {
-            where_bits.push(format!("{} away", distance(d)));
-        }
-        if !where_bits.is_empty() {
-            out.push_str(&format!(" — {}", where_bits.join(" · ")));
-        }
-        out.push('\n');
+    if let Some(h) = hq(c) {
+        facts.push(format!("HQ {h}"));
+    }
+    if let Some(t) = &c.ticker {
+        facts.push(format!("ticker {t}"));
+    }
+    if let Some(ts) = c.last_signal_at {
+        facts.push(format!("last signal {}", fmt_ts(ts)));
+    }
+    match account {
+        Some(a) => facts.push(format!("status: {}", a.status)),
+        None => facts.push("status: not yet an account".into()),
+    }
+    out.push_str(&format!("   {}\n", facts.join(" · ")));
 
-        if let Some(s) = &h.starts_at {
-            out.push_str(&format!("   when: {s}"));
-            if let Some(e) = &h.ends_at {
-                out.push_str(&format!(" to {e}"));
-            }
-            out.push('\n');
-        } else if let Some(p) = &h.published_at {
-            out.push_str(&format!("   published: {p}\n"));
+    if let Some(f) = fit {
+        for r in f.reasons.iter().filter(|r| r.points > 0.0) {
+            let mark = if r.points >= r.max { '+' } else { '~' };
+            out.push_str(&format!("   {mark} {}: {}\n", r.criterion, r.detail));
         }
-        if !h.categories.is_empty() {
-            out.push_str(&format!("   {}\n", h.categories.join(", ")));
+        for r in f.reasons.iter().filter(|r| r.points == 0.0 && r.max > 0.0) {
+            out.push_str(&format!("   − {}: {}\n", r.criterion, r.detail));
         }
-        if let Some(sn) = &h.snippet {
-            out.push_str(&format!("   {sn}\n"));
-        }
-        if let Some(venue) = &h.venue {
-            out.push_str(&format!("   venue: {venue}\n"));
-        }
-        if let Some(addr) = &h.address {
-            out.push_str(&format!("   {addr}\n"));
-        }
-        // Contact detail is the difference between "there is a restaurant"
-        // and "you can call it", so it earns its line when present.
-        let mut contact = Vec::new();
-        if let Some(p) = &h.phone {
-            contact.push(p.clone());
-        }
-        if let Some(w) = &h.website {
-            contact.push(w.clone());
-        }
-        if !contact.is_empty() {
-            out.push_str(&format!("   {}\n", contact.join(" · ")));
-        }
-        if let Some(hours) = &h.opening_hours {
-            out.push_str(&format!("   hours: {hours}\n"));
-        }
-        if let Some(url) = &h.url {
-            out.push_str(&format!("   {url}\n"));
-        }
-        // Location precision matters when deciding whether a distance is
-        // meaningful, so it travels with the id rather than being buried.
+    } else if !c.description.is_empty() {
         out.push_str(&format!(
-            "   id: {} · source: {} · location: {}\n",
-            h.id, h.source, h.geo_precision
+            "   {}\n",
+            crm_core::model::truncate_chars(&c.description, 200)
         ));
-    }
-    out.push_str("\nUse get_document with an id and its kind for the full record.");
-    out
-}
-
-pub fn document(doc: &Value) -> String {
-    let get = |k: &str| doc.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let mut out = String::new();
-    let title = get("title");
-    out.push_str(&format!(
-        "{}\n",
-        if title.is_empty() {
-            "(untitled)"
-        } else {
-            &title
-        }
-    ));
-    out.push_str(&format!(
-        "kind: {}  ·  source: {}\n",
-        get("kind"),
-        get("source")
-    ));
-
-    for (label, key) in [
-        ("city", "city"),
-        ("county", "county"),
-        ("address", "address"),
-        ("url", "url"),
-        ("phone", "phone"),
-        ("website", "website"),
-        ("opening hours", "opening_hours"),
-        ("venue", "venue_name"),
-        ("organizer", "organizer"),
-        ("author", "author"),
-        ("site", "site_name"),
-    ] {
-        let v = get(key);
-        if !v.is_empty() {
-            out.push_str(&format!("{label}: {v}\n"));
-        }
-    }
-    if let Some(geo) = doc.get("_geo") {
-        let lat = geo.get("lat").and_then(Value::as_f64).unwrap_or_default();
-        let lng = geo.get("lng").and_then(Value::as_f64).unwrap_or_default();
-        out.push_str(&format!(
-            "coordinates: {lat}, {lng} ({})\n",
-            get("geo_precision")
-        ));
-    }
-    for (label, key) in [
-        ("starts", "start_time"),
-        ("ends", "end_time"),
-        ("published", "published_at"),
-    ] {
-        if let Some(ts) = doc.get(key).and_then(Value::as_i64)
-            && let Some(s) = crate::search::fmt_ts(ts)
-        {
-            out.push_str(&format!("{label}: {s}\n"));
-        }
-    }
-    if let Some(cats) = doc.get("categories").and_then(Value::as_array)
-        && !cats.is_empty()
-    {
-        let names: Vec<String> = cats
-            .iter()
-            .filter_map(|c| c.as_str().map(String::from))
-            .collect();
-        out.push_str(&format!("categories: {}\n", names.join(", ")));
-    }
-
-    let summary = get("summary");
-    if !summary.is_empty() {
-        out.push_str(&format!("\n{summary}\n"));
-    }
-    let body = get("body");
-    // Sources without prose reuse the summary as the body; print it once.
-    if !body.is_empty() && body != summary {
-        out.push_str(&format!("\n{body}\n"));
     }
     out
 }
 
-pub fn region(v: &Value) -> String {
-    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let mut out = format!("Region: {}", s("region"));
-    if let Some(tz) = v.get("timezone").and_then(Value::as_str) {
-        out.push_str(&format!("  ·  timezone {tz}"));
+pub fn signal_line(s: &Signal, with_company: bool) -> String {
+    let mut out = format!("{} [{}] {}", fmt_ts(s.occurred_at), s.kind, s.title);
+    if with_company && !s.company_name.is_empty() {
+        out.push_str(&format!(
+            " — {} (company_id={})",
+            s.company_name, s.company_id
+        ));
+    }
+    if !s.roles.is_empty() {
+        out.push_str(&format!(" · roles: {}", s.roles.join(", ")));
+    }
+    if let Some(l) = &s.location {
+        out.push_str(&format!(" · {l}"));
+    }
+    if let Some(u) = &s.url {
+        out.push_str(&format!("\n   {u}"));
+    }
+    out
+}
+
+pub fn activity_line(a: &Activity) -> String {
+    let mut out = format!("{} [{}", fmt_ts(a.occurred_at), a.activity_type);
+    if let Some(d) = &a.direction {
+        out.push_str(&format!(", {d}"));
+    }
+    out.push_str(&format!("] by {}", a.actor));
+    if let Some(s) = &a.subject {
+        out.push_str(&format!(": {s}"));
+    }
+    if !a.summary.is_empty() {
+        out.push_str(&format!(" — {}", a.summary));
+    }
+    if let Some(o) = &a.outcome {
+        out.push_str(&format!(" (outcome: {o})"));
+    }
+    out
+}
+
+pub fn account_block(a: &Account) -> String {
+    let mut out = format!("Account: {}", a.status);
+    if let Some(o) = &a.owner {
+        out.push_str(&format!(" · owner {o}"));
+    }
+    if let Some(p) = &a.fit_profile {
+        out.push_str(&format!(" · profile {p}"));
     }
     out.push('\n');
+    if let Some(n) = &a.next_step {
+        out.push_str(&format!("   next step: {n}"));
+        if let Some(t) = a.next_touch_at {
+            out.push_str(&format!(" (by {})", fmt_ts(t)));
+        }
+        out.push('\n');
+    } else if let Some(t) = a.next_touch_at {
+        out.push_str(&format!("   next touch: {}\n", fmt_ts(t)));
+    }
+    if let Some(r) = &a.disqualify_reason {
+        out.push_str(&format!("   disqualified: {r}\n"));
+    }
+    if !a.tags.is_empty() {
+        out.push_str(&format!("   tags: {}\n", a.tags.join(", ")));
+    }
+    out.push_str(&format!(
+        "   updated {} by {}\n",
+        fmt_ts(a.updated_at),
+        a.updated_by
+    ));
+    out
+}
 
-    if let Some(b) = v.get("bounding_box") {
-        let f = |k: &str| b.get(k).and_then(Value::as_f64).unwrap_or_default();
-        out.push_str(&format!(
-            "Bounds: lat {}..{}, lng {}..{}\n",
-            f("min_lat"),
-            f("max_lat"),
-            f("min_lng"),
-            f("max_lng")
-        ));
+pub fn dossier(
+    c: &Company,
+    account: Option<&Account>,
+    signals: &[Signal],
+    activities: &[Activity],
+    fits: &[Fit],
+) -> String {
+    let mut out = format!("{}  id={}\n", c.name, c.id);
+    let mut facts = Vec::new();
+    if let Some(w) = c.website.as_ref().or(c.domain.as_ref()) {
+        facts.push(w.clone());
+    }
+    if let Some(h) = hq(c) {
+        facts.push(format!("HQ {h}"));
+    }
+    if let Some(n) = c.employees {
+        facts.push(format!("{n} employees"));
+    }
+    if let Some(y) = c.founded {
+        facts.push(format!("founded {y}"));
+    }
+    if let Some(t) = &c.ticker {
+        facts.push(format!("ticker {t}"));
+    }
+    if !facts.is_empty() {
+        out.push_str(&format!("{}\n", facts.join(" · ")));
+    }
+    if !c.verticals.is_empty() {
+        out.push_str(&format!("Verticals: {}\n", c.verticals.join(", ")));
+    }
+    if !c.industries.is_empty() {
+        out.push_str(&format!("Industries: {}\n", c.industries.join(", ")));
+    }
+    if !c.tech.is_empty() {
+        out.push_str(&format!("Seen on their site: {}\n", c.tech.join(", ")));
+    }
+    if let (Some(p), Some(s)) = (&c.ats_provider, &c.ats_slug) {
+        out.push_str(&format!("Job board: {p}/{s}\n"));
+    }
+    if !c.description.is_empty() {
+        out.push_str(&format!("\n{}\n", c.description));
     }
 
-    out.push_str("\nIndexed documents:\n");
-    if let Some(counts) = v.get("document_counts").and_then(Value::as_object) {
-        let empty = counts.values().all(|n| n.as_u64() == Some(0));
-        for (k, n) in counts {
-            let fresh = v
-                .get("last_updated")
-                .and_then(|f| f.get(k))
-                .and_then(Value::as_str)
-                .map(|s| format!(" (newest {s})"))
-                .unwrap_or_default();
-            match n.as_u64() {
-                Some(n) => out.push_str(&format!("  {k}: {n}{fresh}\n")),
-                None => out.push_str(&format!(
-                    "  {k}: unknown (the count could not be read){fresh}\n"
-                )),
+    out.push('\n');
+    match account {
+        Some(a) => out.push_str(&account_block(a)),
+        None => out.push_str("Account: none yet — log_activity or update_account creates one.\n"),
+    }
+
+    if !fits.is_empty() {
+        out.push_str("\nFit by profile:\n");
+        for f in fits {
+            out.push_str(&format!("  {} — {}/100\n", f.profile, f.score));
+            for r in &f.reasons {
+                let mark = if r.points >= r.max && r.max > 0.0 {
+                    '+'
+                } else if r.points > 0.0 {
+                    '~'
+                } else {
+                    '−'
+                };
+                out.push_str(&format!("    {mark} {}: {}\n", r.criterion, r.detail));
             }
         }
-        if empty {
-            out.push_str(
-                "  The index is empty — the indexer has not written anything yet, so \
-                 every search will correctly return nothing.\n",
-            );
-        }
     }
 
-    if let Some(places) = v.get("resolvable_places").and_then(Value::as_array) {
-        let names: Vec<String> = places
-            .iter()
-            .filter_map(|p| p.as_str().map(String::from))
-            .collect();
+    out.push_str(&format!("\nRecent signals ({}):\n", signals.len()));
+    if signals.is_empty() {
+        out.push_str("  none\n");
+    }
+    for s in signals {
         out.push_str(&format!(
-            "\nPlace names that resolve to coordinates ({}):\n  {}\n",
-            names.len(),
-            names.join(", ")
+            "  {}\n",
+            signal_line(s, false).replace('\n', "\n  ")
         ));
     }
 
-    if let Some(cats) = v.get("top_place_categories").and_then(Value::as_array)
-        && !cats.is_empty()
-    {
-        out.push_str("\nMost common place categories:\n  ");
-        let rendered: Vec<String> = cats
-            .iter()
-            .filter_map(|c| {
-                Some(format!(
-                    "{} ({})",
-                    c.get("category")?.as_str()?,
-                    c.get("count")?.as_u64()?
-                ))
-            })
-            .collect();
-        out.push_str(&rendered.join(", "));
-        out.push('\n');
+    out.push_str(&format!("\nActivity ({}):\n", activities.len()));
+    if activities.is_empty() {
+        out.push_str("  none\n");
+    }
+    for a in activities {
+        out.push_str(&format!("  {}\n", activity_line(a)));
     }
     out
 }
 
-pub fn locales(v: &Value) -> String {
-    let region = v.get("region").and_then(Value::as_str).unwrap_or("");
-    let list = v
-        .get("locales")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let mut out = format!(
-        "{} locale(s) in {region}. Pass a name or any alias as `city` or `near`; \
-         pass the county as `county` to search_region.\n",
-        list.len()
-    );
+pub fn vertical(v: &Vertical, count: Option<usize>) -> String {
+    let mut out = format!("{} — {}", v.slug, v.name);
+    if let Some(n) = count {
+        out.push_str(&format!(" ({n} companies)"));
+    }
+    out.push('\n');
+    if !v.aliases.is_empty() {
+        out.push_str(&format!("   aka {}\n", v.aliases.join(", ")));
+    }
+    if !v.sic.is_empty() {
+        out.push_str(&format!("   SIC {}\n", v.sic.join(", ")));
+    }
+    if !v.naics.is_empty() {
+        out.push_str(&format!("   NAICS {}\n", v.naics.join(", ")));
+    }
+    if !v.keywords.is_empty() {
+        out.push_str(&format!("   keywords: {}\n", v.keywords.join(", ")));
+    }
+    out
+}
 
-    // The list arrives sorted by county, so a new heading starts a new block.
-    let mut current: Option<Option<&str>> = None;
-    for c in list {
-        let county = c.get("county").and_then(Value::as_str);
-        if current != Some(county) {
-            out.push_str(&match county {
-                Some(k) => format!("\ncounty: {k}\n"),
-                None => "\nno county\n".to_string(),
-            });
-            current = Some(county);
-        }
-        let mut line = format!("  {}", c.get("name").and_then(Value::as_str).unwrap_or(""));
-        let aliases: Vec<String> = c
-            .get("aliases")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+pub fn profile(p: &Profile) -> String {
+    let mut out = format!("{} — {}\n", p.slug, p.name);
+    if !p.description.is_empty() {
+        out.push_str(&format!("   {}\n", p.description));
+    }
+    out.push_str(&format!("   verticals: {}\n", p.verticals.join(", ")));
+    if !p.countries.is_empty() || !p.states.is_empty() {
+        let mut t = p.countries.clone();
+        t.extend(p.states.iter().cloned());
+        out.push_str(&format!("   territory: {}\n", t.join(", ")));
+    }
+    match (p.employees.min, p.employees.max) {
+        (None, None) => {}
+        (a, b) => out.push_str(&format!(
+            "   employees: {}–{}\n",
+            a.map(|v| v.to_string()).unwrap_or_default(),
+            b.map(|v| v.to_string()).unwrap_or_default()
+        )),
+    }
+    if !p.signals.hiring_roles.is_empty() {
+        out.push_str(&format!(
+            "   hiring for: {} (last {} days)\n",
+            p.signals.hiring_roles.join(", "),
+            p.signals.recency_days
+        ));
+    }
+    if !p.keywords.is_empty() {
+        out.push_str(&format!("   keywords: {}\n", p.keywords.join(", ")));
+    }
+    let w = p.weights;
+    out.push_str(&format!(
+        "   weights: vertical {} · size {} · geo {} · hiring {} · news {} · keywords {}\n",
+        w.vertical, w.size, w.geo, w.hiring, w.news, w.keywords
+    ));
+    out
+}
+
+/// `describe_market`'s text from its own structured payload, so the two
+/// can never disagree.
+pub fn market(v: &Value, m: &MarketConfig) -> String {
+    let mut out = format!("{}\n\n", v["market"].as_str().unwrap_or_default());
+    if let Some(c) = v["counts"].as_object() {
+        let parts: Vec<String> = c
             .iter()
-            .filter_map(|a| a.as_str().map(|a| format!("{a:?}")))
+            .map(|(k, n)| {
+                format!(
+                    "{k}: {}",
+                    n.as_u64().map(|x| x.to_string()).unwrap_or("?".into())
+                )
+            })
             .collect();
-        if !aliases.is_empty() {
-            line.push_str(&format!("  ·  aka {}", aliases.join(", ")));
+        out.push_str(&format!("Indexed — {}\n", parts.join(" · ")));
+    }
+    if let Some(f) = v["last_updated"].as_object() {
+        let parts: Vec<String> = f
+            .iter()
+            .map(|(k, t)| format!("{k} {}", t.as_str().unwrap_or("never")))
+            .collect();
+        out.push_str(&format!("Freshness — {}\n", parts.join(" · ")));
+    }
+
+    out.push_str("\nVerticals:\n");
+    for vert in &m.verticals {
+        let n = v["verticals"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["slug"] == vert.slug.as_str()))
+            .and_then(|x| x["companies"].as_u64());
+        out.push_str(&format!(
+            "  {} — {} ({} companies)\n",
+            vert.slug,
+            vert.name,
+            n.map(|x| x.to_string()).unwrap_or("?".into())
+        ));
+    }
+    out.push_str("\nProfiles:\n");
+    for p in &m.profiles {
+        out.push_str(&format!("  {} — {}\n", p.slug, p.name));
+    }
+    for (key, label) in [
+        ("pipeline", "Pipeline"),
+        ("signals_last_90_days", "Signals, last 90 days"),
+        ("company_sizes", "Company sizes"),
+    ] {
+        if let Some(o) = v[key].as_object()
+            && !o.is_empty()
+        {
+            let parts: Vec<String> = o.iter().map(|(k, n)| format!("{k} {n}")).collect();
+            out.push_str(&format!("\n{label}: {}\n", parts.join(" · ")));
         }
-        let f = |k: &str| c.get(k).and_then(Value::as_f64).unwrap_or_default();
-        line.push_str(&format!("  ·  {:.4}, {:.4}", f("lat"), f("lng")));
-        if let Some(r) = c.get("default_radius_m").and_then(Value::as_u64) {
-            line.push_str(&format!("  ·  {} default radius", distance(r)));
-        }
-        out.push_str(&line);
-        out.push('\n');
     }
     out
 }
@@ -314,114 +362,50 @@ pub fn locales(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crm_core::model::{AccountStatus, SignalKind};
 
-    fn hit() -> Hit {
-        Hit {
-            id: "abc123".into(),
-            kind: "place".into(),
-            title: "Carlson Vineyards".into(),
-            snippet: Some("Family **winery** on East Orchard Mesa".into()),
-            city: Some("Palisade".into()),
-            categories: vec!["winery".into()],
-            url: Some("https://example.test/carlson".into()),
-            address: Some("461 35 Rd".into()),
-            phone: Some("+1-970-555-0123".into()),
-            website: None,
-            opening_hours: Some("Mo-Su 11:00-18:00".into()),
-            venue: None,
-            site_name: None,
-            lat: 39.11,
-            lng: -108.35,
-            distance_m: Some(12_400),
-            geo_precision: "exact".into(),
-            source: "osm".into(),
-            starts_at: None,
-            ends_at: None,
-            published_at: None,
-        }
+    fn company() -> Company {
+        let mut c = Company::new("abc", "Acme Brewing", "crawl");
+        c.domain = Some("acme.test".into());
+        c.verticals = vec!["craft-beverage".into()];
+        c.employees = Some(80);
+        c.hq_city = Some("Denver".into());
+        c.hq_state = Some("CO".into());
+        c
     }
 
     #[test]
-    fn empty_results_say_what_to_try_next() {
-        let out = hits("0 result(s)", &[]);
-        assert!(out.contains("Nothing matched"));
-        assert!(out.contains("describe_region"));
+    fn list_entries_carry_the_id_and_status() {
+        let s = company_entry(0, &company(), None, None);
+        assert!(s.starts_with("1. Acme Brewing (acme.test)"));
+        assert!(s.contains("id=abc"));
+        assert!(s.contains("status: not yet an account"));
+        assert!(s.contains("HQ Denver, CO"));
     }
 
     #[test]
-    fn a_hit_renders_its_location_distance_and_id() {
-        let out = hits("1 result", &[hit()]);
-        assert!(out.contains("1. Carlson Vineyards [place]"));
-        assert!(out.contains("Palisade"));
-        assert!(out.contains("12.4 km away"));
-        assert!(out.contains("id: abc123"));
-        assert!(out.contains("+1-970-555-0123"));
-        assert!(out.contains("hours: Mo-Su 11:00-18:00"));
-        assert!(out.contains("location: exact"));
-    }
-
-    #[test]
-    fn close_distances_read_in_metres() {
-        assert_eq!(distance(29), "29 m");
-        assert_eq!(distance(999), "999 m");
-        assert_eq!(distance(1_000), "1.0 km");
-        assert_eq!(distance(12_400), "12.4 km");
-    }
-
-    #[test]
-    fn a_body_that_only_repeats_the_summary_prints_once() {
-        let doc = serde_json::json!({
-            "title": "X", "kind": "place", "source": "osm",
-            "summary": "X is a cafe.", "body": "X is a cafe.",
-        });
-        assert_eq!(document(&doc).matches("X is a cafe.").count(), 1);
-    }
-
-    #[test]
-    fn header_offers_paging_only_when_more_remain() {
-        assert!(header("Colorado", "\"x\"", None, 10, 250, 0).contains("offset=10"));
-        assert!(!header("Colorado", "\"x\"", None, 10, 10, 0).contains("offset"));
-    }
-
-    #[test]
-    fn locales_group_under_their_county_with_aliases() {
-        let v = serde_json::json!({
-            "region": "Colorado",
-            "locales": [
-                { "name": "Buena Vista", "aliases": [], "county": "Chaffee",
-                  "lat": 38.8422, "lng": -106.1311, "default_radius_m": 12000 },
-                { "name": "Salida", "aliases": ["Salida, CO"], "county": "Chaffee",
-                  "lat": 38.5347, "lng": -105.9989, "default_radius_m": 12000 },
-                { "name": "Nowhere", "aliases": [], "county": null,
-                  "lat": 39.0, "lng": -105.0, "default_radius_m": 5000 },
-            ],
-        });
-        let out = locales(&v);
-        assert!(out.starts_with("3 locale(s) in Colorado."));
-        assert_eq!(out.matches("county: Chaffee").count(), 1);
-        assert!(out.contains(
-            "  Salida  ·  aka \"Salida, CO\"  ·  38.5347, -105.9989  ·  12.0 km default radius"
-        ));
-        assert!(out.contains("no county\n  Nowhere"));
-    }
-
-    #[test]
-    fn an_unreadable_count_is_not_mistaken_for_an_empty_index() {
-        let v = serde_json::json!({
-            "region": "Colorado",
-            "document_counts": { "places": null, "events": 0, "articles": 0 },
-        });
-        let out = region(&v);
-        assert!(!out.contains("index is empty"));
-        assert!(out.contains("places: unknown"));
-    }
-
-    #[test]
-    fn an_empty_index_is_called_out_rather_than_looking_like_no_matches() {
-        let v = serde_json::json!({
-            "region": "Colorado",
-            "document_counts": { "places": 0, "events": 0, "articles": 0 },
-        });
-        assert!(region(&v).contains("index is empty"));
+    fn a_dossier_shows_account_signals_and_activity() {
+        let mut a = Account::new("abc", "Acme Brewing", "bdr");
+        a.status = AccountStatus::Contacted;
+        a.next_step = Some("Follow up".into());
+        let s = Signal::new("abc", SignalKind::Hiring, "jobs", "1", "Hiring: Planner", 0);
+        let act = Activity {
+            id: "x".into(),
+            account_id: "abc".into(),
+            company_name: "Acme Brewing".into(),
+            activity_type: crm_core::model::ActivityType::Email,
+            direction: Some("outbound".into()),
+            subject: Some("Hello".into()),
+            summary: "Intro".into(),
+            outcome: None,
+            occurred_at: 0,
+            actor: "bdr".into(),
+            created_at: 0,
+        };
+        let d = dossier(&company(), Some(&a), &[s], &[act], &[]);
+        assert!(d.contains("Account: contacted"));
+        assert!(d.contains("next step: Follow up"));
+        assert!(d.contains("[hiring] Hiring: Planner"));
+        assert!(d.contains("[email, outbound] by bdr: Hello — Intro"));
     }
 }

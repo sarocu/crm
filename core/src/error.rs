@@ -4,8 +4,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("region config: {0}")]
-    Region(String),
+    #[error("market config: {0}")]
+    Market(String),
 
     #[error("meilisearch: {0}")]
     Meili(#[from] Box<meilisearch_sdk::errors::Error>),

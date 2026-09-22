@@ -1,6 +1,6 @@
 # The search database, pinned and pre-configured.
 #
-#   docker build -f meilisearch/Dockerfile -t regional-meilisearch .
+#   docker build -f meilisearch/Dockerfile -t crm-meilisearch .
 #
 # MEILI_MASTER_KEY is deliberately NOT baked in — inject it at runtime from
 # HeyoSecret (or the compose environment) so the image carries no secret.
@@ -27,8 +27,8 @@ RUN apk add --no-cache openssh iproute2 curl \
 COPY rootfs/init.sh /init.sh
 RUN chmod +x /init.sh \
     && mkdir -p /etc/heyo \
-    && echo 'regional-meili' > /etc/heyo/hostname \
-    && echo 'regional-meili' > /etc/hostname
+    && echo 'crm-meili' > /etc/heyo/hostname \
+    && echo 'crm-meili' > /etc/hostname
 
 COPY meilisearch/config.toml /etc/meilisearch/config.toml
 

@@ -1,0 +1,95 @@
+# Market definition for the CRM stack.
+#
+# `verticals` are the industries we sell into. The indexer tags each company
+# with every vertical whose SIC/NAICS codes, Wikidata classes or keywords it
+# matches. EDGAR and Wikidata only sweep companies in a vertical; a company
+# the crawler or add_company brings in without one is kept but untagged.
+#
+# `profiles` are ideal customer profiles. The MCP server's `find_prospects`
+# scores companies against one, and `get_company` scores against all of them.
+#
+# Copy this file, edit it, and point MARKET_CONFIG (or the MARKET_FILE build
+# arg) at the copy.
+
+name = "Example outbound"
+slug = "example"
+
+# Search vocabulary. Omit to take the built-in defaults; anything set here
+# REPLACES them rather than adding to them.
+[vocabulary]
+stop_words = ["a", "an", "and", "at", "for", "in", "is", "it", "of", "on", "or", "the", "to", "with"]
+synonyms = [
+  ["inc", "incorporated", "corp", "corporation", "co", "company"],
+  ["llc", "ltd", "limited"],
+  ["erp", "enterprise resource planning"],
+  ["3pl", "third party logistics", "fulfillment"],
+  ["brewery", "brewing", "taproom", "brewpub"],
+  ["winery", "vineyard", "wine"],
+]
+
+[[verticals]]
+slug = "craft-beverage"
+name = "Craft beverage"
+aliases = ["brewery", "winery", "distillery", "craft beer", "beverage"]
+sic = ["2082", "2084", "2085", "2086"]
+naics = ["312120", "312130", "312140", "31211"]
+# brewery, winery. Check any QID on wikidata.org before adding it.
+wikidata = ["Q131734", "Q156362"]
+keywords = ["brewery", "taproom", "winery", "distillery", "canning line", "barrel program"]
+# Trade-press RSS/Atom feeds for this vertical, e.g.
+# feeds = ["https://example-trade-press.test/feed"]
+feeds = []
+
+[[verticals]]
+slug = "logistics"
+name = "Logistics & warehousing"
+aliases = ["3pl", "freight", "warehousing", "trucking", "supply chain"]
+sic = ["4213", "4214", "4225", "4226", "4731"]
+naics = ["484", "4885", "493"]
+wikidata = []
+keywords = ["3pl", "freight", "warehouse", "fulfillment", "cold storage", "last mile"]
+feeds = []
+
+[[verticals]]
+slug = "food-manufacturing"
+name = "Food manufacturing"
+aliases = ["food processing", "cpg food", "packaged food"]
+sic = ["2011", "2013", "2020", "2024", "2030", "2033", "2040", "2050", "2060", "2070", "2080", "2090"]
+naics = ["311"]
+wikidata = []
+keywords = ["co-packer", "copacker", "food manufacturer", "food processing", "usda", "haccp"]
+feeds = []
+
+[[verticals]]
+slug = "vertical-saas"
+name = "Vertical SaaS"
+aliases = ["saas", "software"]
+sic = ["7372", "7373", "7374"]
+naics = ["5112", "518210", "541511"]
+wikidata = []
+keywords = ["saas", "platform", "api", "software for"]
+feeds = []
+
+[[profiles]]
+slug = "mid-market-ops"
+name = "Mid-market ops-heavy"
+description = "Physical-goods companies big enough to feel ops pain, small enough to switch."
+aliases = ["ops heavy", "mid market"]
+verticals = ["craft-beverage", "food-manufacturing", "logistics"]
+countries = ["US"]
+states = []
+employees = { min = 50, max = 1000 }
+keywords = ["erp", "netsuite", "quickbooks", "inventory", "warehouse", "spreadsheet"]
+signals = { hiring_roles = ["operations", "supply chain", "logistics", "inventory", "controller"], recency_days = 90 }
+weights = { vertical = 3, size = 2, geo = 1, hiring = 3, news = 1, keywords = 2 }
+
+[[profiles]]
+slug = "growing-saas"
+name = "Growing vertical SaaS"
+description = "Software companies scaling their go-to-market."
+verticals = ["vertical-saas"]
+countries = ["US", "CA"]
+employees = { min = 20, max = 500 }
+keywords = ["series a", "series b", "revenue operations", "hubspot", "salesforce"]
+signals = { hiring_roles = ["sales", "revenue operations", "account executive", "sdr", "bdr"], recency_days = 60 }
+weights = { vertical = 2, size = 2, geo = 0.5, hiring = 4, news = 2, keywords = 1 }

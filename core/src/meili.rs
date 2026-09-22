@@ -18,8 +18,9 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:7700";
 
 /// Build a client from `MEILI_URL` plus whichever key this service uses.
 ///
-/// `bot` passes `MEILI_MASTER_KEY` (it writes); `mcp` passes
-/// `MEILI_SEARCH_KEY` (it must not).
+/// `bot` and `dashboard` pass `MEILI_MASTER_KEY`; `mcp` builds two clients,
+/// from `MEILI_READ_KEY` and `MEILI_WRITE_KEY`, scoped so it can read
+/// everything but write only CRM state.
 pub fn client_from_env(key_var: &str) -> Result<Client> {
     let url = std::env::var("MEILI_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     let url = url.trim_end_matches('/').to_string();
@@ -84,7 +85,11 @@ pub async fn await_task(client: &Client, info: TaskInfo) -> Result<()> {
     Ok(())
 }
 
-/// Upsert documents in chunks, awaiting each batch.
+/// Write whole documents in chunks, awaiting each batch.
+///
+/// Every writer in the stack builds complete documents (merging with what
+/// is stored first where that matters), so this *replaces* rather than
+/// patches: a field that went away upstream goes away here too.
 ///
 /// Returns the number of documents written. Awaiting each chunk keeps the
 /// indexer honest about backpressure: a slow Meilisearch slows ingestion
@@ -100,7 +105,7 @@ pub async fn upsert_chunked<T: Serialize + Send + Sync>(
     let idx = client.index(index);
     let mut written = 0usize;
     for chunk in docs.chunks(CHUNK_SIZE) {
-        let info = idx.add_or_update(chunk, Some("id")).await?;
+        let info = idx.add_or_replace(chunk, Some("id")).await?;
         await_task(client, info).await?;
         written += chunk.len();
     }

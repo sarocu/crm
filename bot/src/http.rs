@@ -27,7 +27,7 @@ pub struct Fetcher {
     user_agent: String,
     /// Next time each host may be contacted.
     next_allowed: Mutex<HashMap<String, Instant>>,
-    /// Per-host overrides, e.g. Nominatim's hard 1 req/s policy.
+    /// Per-host overrides, e.g. the SEC's ten-requests-a-second policy.
     host_intervals: HashMap<String, Duration>,
     robots: Mutex<HashMap<String, Option<Robot>>>,
 }
@@ -127,46 +127,6 @@ impl Fetcher {
         let text = self.get_text(url).await?;
         serde_json::from_str(&text)
             .with_context(|| format!("GET {url} did not return the expected JSON"))
-    }
-
-    /// POST a form body, which is how Overpass takes its query language.
-    pub async fn post_form<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &str,
-        form: &[(&str, &str)],
-    ) -> Result<T> {
-        let host = host_of(url)?;
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            self.throttle(&host).await;
-
-            let res = self.client.post(url).form(form).send().await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    let text = r.text().await.context("reading the response body")?;
-                    return serde_json::from_str(&text)
-                        .with_context(|| format!("POST {url} did not return the expected JSON"));
-                }
-                Ok(r) if should_retry(r.status()) => {
-                    let hinted = parse_retry_after(&r);
-                    tracing::warn!(url, status = %r.status(), attempt, "retrying POST");
-                    if attempt >= MAX_ATTEMPTS {
-                        bail!("POST {url} still failing after {MAX_ATTEMPTS} attempts");
-                    }
-                    let backoff = hinted.unwrap_or(Duration::from_secs(5 * attempt as u64));
-                    tokio::time::sleep(backoff.min(Duration::from_secs(180))).await;
-                }
-                Ok(r) => bail!("POST {url} failed with {}", r.status()),
-                Err(e) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(e).with_context(|| format!("POST {url}"));
-                    }
-                    tracing::warn!(url, error = %e, attempt, "POST error, retrying");
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                }
-            }
-        }
     }
 
     /// Fetch a body as text, refusing anything oversized or non-textual.

@@ -1,7 +1,7 @@
 # Baked-in Meilisearch configuration.
 #
 # Index settings (searchable/filterable/sortable attributes, synonyms) are
-# NOT set here — they are applied by `ensure_indexes` in the regional-core
+# NOT set here — they are applied by `ensure_indexes` in the crm-core
 # crate, so the schema lives with the code that depends on it.
 
 db_path = "/data.ms"

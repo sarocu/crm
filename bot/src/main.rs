@@ -1,12 +1,12 @@
-//! Continuous indexer for the regional search stack.
+//! Continuous indexer for the CRM stack.
 //!
 //! Runs forever, walking each source on its own schedule and feeding
 //! everything through one pipeline into Meilisearch. Pass `--once` to run a
 //! single cycle of every source and exit, which is what CI and the
 //! verification steps use.
 
+mod classify;
 mod config;
-mod geocode;
 mod http;
 mod metrics;
 mod pipeline;
@@ -18,15 +18,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Json, Router, extract::State, routing::get};
+use crm_core::index::ensure_indexes;
+use crm_core::market::MarketConfig;
+use crm_core::meili;
 use rand::RngExt;
-use regional_core::index::ensure_indexes;
-use regional_core::meili;
-use regional_core::region::RegionConfig;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::geocode::Geocoder;
 use crate::http::Fetcher;
 use crate::metrics::SharedMetrics;
 use crate::pipeline::Pipeline;
@@ -35,19 +34,18 @@ use crate::state::BotState;
 
 const MEILI_BOOT_WAIT: Duration = Duration::from_secs(180);
 
-/// Nominatim's usage policy is a hard one request per second. The extra
-/// 200 ms keeps us clear of it even with clock drift.
-const NOMINATIM_INTERVAL: Duration = Duration::from_millis(1_200);
-/// Overpass is a small volunteer-run cluster; one query every few seconds
-/// is well within what it asks for.
-const OVERPASS_INTERVAL: Duration = Duration::from_secs(5);
+/// The SEC allows ten requests a second across its hosts. Two hosts at
+/// 150 ms each stays under that even when both are busy.
+const SEC_INTERVAL: Duration = Duration::from_millis(150);
+/// The Wikidata query service is shared and asks for restraint.
+const WIKIDATA_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct Health {
     metrics: SharedMetrics,
     state: Arc<BotState>,
     client: meili::Client,
-    region_name: String,
+    market_name: String,
     /// Echoed back so an operator can confirm which contact address the
     /// upstream APIs are actually seeing.
     user_agent: String,
@@ -58,10 +56,11 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let config = Arc::new(Config::from_env()?);
-    let region = Arc::new(RegionConfig::from_env().context("loading the region config")?);
+    let market = Arc::new(MarketConfig::from_env().context("loading the market config")?);
     tracing::info!(
-        region = %region.name,
-        cities = region.cities.len(),
+        market = %market.name,
+        verticals = market.verticals.len(),
+        profiles = market.profiles.len(),
         seeds = config.crawl_seeds.len(),
         once = config.once,
         "starting the indexer"
@@ -69,7 +68,7 @@ async fn main() -> Result<()> {
 
     let client = meili::client_from_env("MEILI_MASTER_KEY")?;
     meili::wait_healthy(&client, MEILI_BOOT_WAIT).await?;
-    ensure_indexes(&client, &region)
+    ensure_indexes(&client, &market)
         .await
         .context("applying index settings")?;
 
@@ -82,28 +81,18 @@ async fn main() -> Result<()> {
 
     let fetcher = Arc::new(
         Fetcher::new(&config.user_agent)?
-            .with_host_interval(&host_of(&config.nominatim_url), NOMINATIM_INTERVAL)
-            .with_host_interval(&host_of(&config.overpass_url), OVERPASS_INTERVAL),
+            .with_host_interval(&host_of(&config.edgar_tickers_url), SEC_INTERVAL)
+            .with_host_interval(&host_of(&config.edgar_submissions_url), SEC_INTERVAL)
+            .with_host_interval(&host_of(&config.wikidata_sparql), WIKIDATA_INTERVAL),
     );
-    let geocoder = Arc::new(Geocoder::new(
-        fetcher.clone(),
-        bot_state.clone(),
-        region.clone(),
-        config.nominatim_url.clone(),
-    ));
 
     let ctx = Arc::new(Ctx {
         http: fetcher,
-        region: region.clone(),
+        market: market.clone(),
         state: bot_state.clone(),
-        geocoder,
         config: config.clone(),
     });
-    let pipeline = Arc::new(Pipeline::new(
-        client.clone(),
-        (*region).clone(),
-        bot_state.clone(),
-    ));
+    let pipeline = Arc::new(Pipeline::new(client.clone(), (*market).clone()));
     let metrics = SharedMetrics::new();
     let ct = CancellationToken::new();
 
@@ -111,7 +100,7 @@ async fn main() -> Result<()> {
         metrics: metrics.clone(),
         state: bot_state.clone(),
         client: client.clone(),
-        region_name: region.name.clone(),
+        market_name: market.name.clone(),
         user_agent: config.user_agent.clone(),
     };
     let health_task = tokio::spawn(serve_health(config.clone(), health, ct.clone()));
@@ -203,8 +192,8 @@ async fn run_once(
                         received = stats.received,
                         written = stats.written,
                         unchanged = stats.unchanged,
-                        suppressed = stats.suppressed,
-                        out_of_region = stats.out_of_region,
+                        merged = stats.merged,
+                        orphaned = stats.orphaned,
                         invalid = stats.invalid,
                         "source cycle complete"
                     );
@@ -305,7 +294,7 @@ async fn healthz(State(h): State<Health>) -> Json<serde_json::Value> {
     let (started_at, sources) = h.metrics.snapshot().await;
     Json(json!({
         "status": if meili_ok { "ok" } else { "degraded" },
-        "region": h.region_name,
+        "market": h.market_name,
         "meilisearch": if meili_ok { "available" } else { "unreachable" },
         "started_at": started_at,
         "user_agent": h.user_agent,

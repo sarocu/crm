@@ -1,4 +1,4 @@
-# regional — a region-scoped search stack.
+# crm — a prospecting CRM for a BDR agent, over MCP.
 #
 # `make` on its own lists every target. The paths worth knowing:
 #
@@ -7,21 +7,21 @@
 #   make bot-once   one cycle of every source, then exit
 #   make health     probe every service
 #
-# Anything that builds an image takes REGION_FILE — the one file that makes
-# this stack Colorado-specific, baked in at build time:
+# Anything that builds an image takes MARKET_FILE — the verticals and
+# customer profiles this deployment sells into, baked in at build time:
 #
-#   make up REGION_FILE=region.vermont.toml
+#   make up MARKET_FILE=market.acme.toml
 
 CARGO       ?= cargo
 COMPOSE     ?= docker compose
-REGION_FILE ?= region.colorado.toml
-PREFIX      ?= regional
+MARKET_FILE ?= market.example.toml
+PREFIX      ?= crm
 TAG         ?= dev
 
 SERVICES := meilisearch bot mcp dashboard
 
-# compose reads REGION_FILE from the environment, so pass it down.
-export REGION_FILE
+# compose reads MARKET_FILE from the environment, so pass it down.
+export MARKET_FILE
 
 # Host-side run targets read .env the same way compose does.
 ENV := set -a; [ -f .env ] && . ./.env; set +a;
@@ -59,23 +59,24 @@ meili: .env ## Start only Meilisearch, for running binaries on the host
 	$(COMPOSE) up -d meilisearch
 
 run-mcp: ## Run the MCP server on the host (port 8080)
-	$(ENV) REGION_CONFIG=$(REGION_FILE) \
+	$(ENV) MARKET_CONFIG=$(MARKET_FILE) \
 	  MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} \
-	  MEILI_SEARCH_KEY=$${MEILI_SEARCH_KEY:-$$MEILI_MASTER_KEY} \
+	  MEILI_READ_KEY=$${MEILI_READ_KEY:-$$MEILI_MASTER_KEY} \
+	  MEILI_WRITE_KEY=$${MEILI_WRITE_KEY:-$$MEILI_MASTER_KEY} \
 	  $(CARGO) run -p mcp
 
 run-bot: ## Run the indexer on the host (port 8081)
-	$(ENV) REGION_CONFIG=$(REGION_FILE) \
+	$(ENV) MARKET_CONFIG=$(MARKET_FILE) \
 	  MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} \
 	  $(CARGO) run -p bot
 
 run-bot-once: ## One cycle of every source on the host, then exit
-	$(ENV) REGION_CONFIG=$(REGION_FILE) \
+	$(ENV) MARKET_CONFIG=$(MARKET_FILE) \
 	  MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} \
 	  $(CARGO) run -p bot -- --once
 
-run-dashboard: ## Run the dashboard on the host (ports 8090/8091)
-	$(ENV) REGION_CONFIG=$(REGION_FILE) \
+run-dashboard: ## Run the dashboard on the host (port 8090)
+	$(ENV) MARKET_CONFIG=$(MARKET_FILE) \
 	  MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} \
 	  $(CARGO) run -p dashboard
 
@@ -115,7 +116,7 @@ bot-once: .env ## One cycle of every source in Docker, then exit
 health: ## Probe every health endpoint
 	@fail=0; \
 	for probe in "meilisearch 7700 /health" "mcp 8080 /healthz" "bot 8081 /healthz" \
-	             "dashboard 8090 /healthz" "public-form 8091 /healthz"; do \
+	             "dashboard 8090 /healthz"; do \
 	  set -- $$probe; \
 	  if curl -fsS -m 3 "http://127.0.0.1:$$2$$3" >/dev/null 2>&1; then \
 	    printf '  ok    %-12s :%s\n' "$$1" "$$2"; \
@@ -127,7 +128,6 @@ health: ## Probe every health endpoint
 urls: ## Print where everything is listening
 	@echo
 	@echo "  operator dashboard   http://localhost:8090"
-	@echo "  public request form  http://localhost:8091"
 	@echo "  MCP endpoint         http://localhost:8080/mcp   (Authorization: Bearer \$$MCP_AUTH_TOKEN)"
 	@echo "  indexer health       http://localhost:8081/healthz"
 	@echo "  meilisearch          http://localhost:7700"
@@ -135,10 +135,10 @@ urls: ## Print where everything is listening
 
 ##@ Images
 
-images: $(addprefix image-,$(SERVICES)) ## Build all four images, tagged regional-<svc>:dev
+images: $(addprefix image-,$(SERVICES)) ## Build all four images, tagged crm-<svc>:dev
 
 image-%: ## Build one image (image-mcp, image-bot, image-dashboard, image-meilisearch)
-	docker build -f $*/Dockerfile --build-arg REGION_FILE=$(REGION_FILE) \
+	docker build -f $*/Dockerfile --build-arg MARKET_FILE=$(MARKET_FILE) \
 	  -t $(PREFIX)-$*:$(TAG) .
 
 ##@ Deployment
@@ -146,8 +146,8 @@ image-%: ## Build one image (image-mcp, image-bot, image-dashboard, image-meilis
 deploy: ## Build, push and deploy to heyo — needs REGISTRY and the secrets
 	deploy/heyo-deploy.sh
 
-search-key: ## Mint (or reuse) the search-only Meilisearch key and print it
-	@$(ENV) MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} deploy/create-search-key.sh
+mcp-keys: ## Mint (or reuse) the MCP server's scoped read and write keys
+	@$(ENV) MEILI_URL=$${MEILI_URL:-http://127.0.0.1:7700} deploy/create-mcp-keys.sh
 
 ##@ Housekeeping
 
@@ -159,7 +159,7 @@ search-key: ## Mint (or reuse) the search-only Meilisearch key and print it
 	      -e "s|^MCP_AUTH_TOKEN=.*|MCP_AUTH_TOKEN=$$(openssl rand -hex 32)|" \
 	      .env.example > $@; \
 	  echo "wrote .env with fresh secrets — now set CONTACT_EMAIL to a real"; \
-	  echo "address you monitor: OSM, Wikimedia and Nominatim all require one"; \
+	  echo "address you monitor: SEC EDGAR and Wikimedia both require one"; \
 	  echo "and the indexer refuses to start without it."; \
 	fi
 
@@ -181,4 +181,4 @@ help: ## List every target
 .PHONY: build release test clippy fmt fmt-check check \
         meili run-mcp run-bot run-bot-once run-dashboard \
         up up-fg down down-hard restart ps logs bot-once health urls \
-        images deploy search-key env clean clean-all help
+        images deploy mcp-keys env clean clean-all help

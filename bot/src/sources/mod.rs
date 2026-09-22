@@ -5,30 +5,30 @@
 //! survives restarts and no source has to hold a whole state in memory.
 
 pub mod crawl;
-pub mod overpass;
-pub mod submissions;
-pub mod wikipedia;
+pub mod edgar;
+pub mod jobs;
+pub mod news;
+pub mod requests;
+pub mod wikidata;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use regional_core::model::Doc;
-use regional_core::region::RegionConfig;
+use crm_core::market::MarketConfig;
+use crm_core::model::Doc;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::geocode::Geocoder;
 use crate::http::Fetcher;
 use crate::state::BotState;
 
 /// Everything a source is allowed to reach.
 pub struct Ctx {
     pub http: Arc<Fetcher>,
-    pub region: Arc<RegionConfig>,
+    pub market: Arc<MarketConfig>,
     pub state: Arc<BotState>,
-    pub geocoder: Arc<Geocoder>,
     pub config: Arc<Config>,
 }
 
@@ -79,12 +79,14 @@ pub trait Source: Send + Sync {
 /// Every source the indexer knows how to run.
 pub fn all() -> Vec<Box<dyn Source>> {
     vec![
-        // Submissions first: a reviewer's approval should show up quickly,
-        // and the batch is tiny compared with a source sweep.
-        Box::new(submissions::Submissions),
-        Box::new(overpass::Overpass),
-        Box::new(wikipedia::Wikipedia),
+        // Requests first: a company the agent just asked for should show up
+        // quickly, and the batch is tiny compared with a sweep.
+        Box::new(requests::Requests),
+        Box::new(edgar::Edgar::default()),
+        Box::new(wikidata::Wikidata),
         Box::new(crawl::Crawl),
+        Box::new(jobs::Jobs),
+        Box::new(news::News),
     ]
 }
 
@@ -117,15 +119,12 @@ mod tests {
 
     #[test]
     fn a_missing_or_malformed_cursor_starts_from_zero() {
-        assert_eq!(cursor_usize(&None, "tile"), 0);
-        assert_eq!(cursor_usize(&Some(serde_json::json!({})), "tile"), 0);
+        assert_eq!(cursor_usize(&None, "pos"), 0);
+        assert_eq!(cursor_usize(&Some(serde_json::json!({})), "pos"), 0);
         assert_eq!(
-            cursor_usize(&Some(serde_json::json!({"tile": "x"})), "tile"),
+            cursor_usize(&Some(serde_json::json!({"pos": "x"})), "pos"),
             0
         );
-        assert_eq!(
-            cursor_usize(&Some(serde_json::json!({"tile": 7})), "tile"),
-            7
-        );
+        assert_eq!(cursor_usize(&Some(serde_json::json!({"pos": 7})), "pos"), 7);
     }
 }

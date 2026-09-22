@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use regional_core::model::now_ts;
+use crm_core::model::now_ts;
 use serde::Serialize;
 use tokio::sync::RwLock;
 

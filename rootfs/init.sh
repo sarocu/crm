@@ -1,5 +1,5 @@
 #!/bin/sh
-# PID 1 for the regional Firecracker microVM images.
+# PID 1 for the CRM stack's Firecracker microVM images.
 #
 # Vendored from heyo.git infra/firecracker/rootfs/init.sh — keep it close to
 # that original so upstream fixes stay diffable.
@@ -15,7 +15,7 @@
 #
 #     Kernel panic - not syncing: Requested init /init.sh failed (error -2)
 #
-# which is what every regional image did until this was added. The Dockerfile's
+# which is what every image in this stack did until this was added. The Dockerfile's
 # ENTRYPOINT has nothing to do with it — that is Docker metadata, and the
 # kernel never reads it. ENTRYPOINT is still what `docker compose up` uses, so
 # both ways of running these images keep working.

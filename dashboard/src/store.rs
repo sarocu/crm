@@ -1,52 +1,37 @@
-//! Everything the dashboard reads and writes.
+//! Everything the dashboard reads. It writes nothing: the BDR agent owns
+//! CRM state through MCP, and the indexer owns market data.
 
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use crm_core::index::{ACCOUNTS, ACTIVITIES, COMPANIES, COMPANY_REQUESTS, SIGNALS};
+use crm_core::market::MarketConfig;
+use crm_core::meili::Client;
+use crm_core::model::{Account, AccountStatus, Activity, Company, Signal};
+use crm_core::request::CompanyRequest;
 use meilisearch_sdk::search::{SearchQuery, Selectors};
-use regional_core::index::{CONTENT_INDEXES, SUBMISSIONS};
-use regional_core::meili::{self, Client};
-use regional_core::model::{Kind, now_ts};
-use regional_core::region::RegionConfig;
-use regional_core::submission::{Request, Status, Submission};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Ceiling on a submissions page, so a runaway queue cannot render forever.
+/// Ceiling on a list page, so a runaway table cannot render forever.
 pub const PAGE_SIZE: usize = 50;
 
 pub struct Store {
     pub client: Client,
-    pub region: RegionConfig,
+    pub market: MarketConfig,
     http: reqwest::Client,
     bot_health_url: String,
 }
 
-/// One row in the index browser, used when triaging an edit request to find
-/// the document it refers to.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BrowseHit {
-    pub id: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub city: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub source: String,
-    #[serde(default)]
-    pub categories: Vec<String>,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct Overview {
-    pub documents: BTreeMap<String, usize>,
+    pub documents: BTreeMap<String, Option<usize>>,
     pub freshest: BTreeMap<String, Option<i64>>,
-    pub submissions: BTreeMap<String, usize>,
-    pub top_categories: Vec<(String, usize)>,
+    pub pipeline: BTreeMap<String, usize>,
+    pub by_vertical: BTreeMap<String, usize>,
+    pub signals_30d: BTreeMap<String, usize>,
+    pub pending_requests: usize,
     /// The indexer's `/healthz`, or `None` when it cannot be reached.
     pub bot: Option<BotHealth>,
 }
@@ -97,18 +82,27 @@ pub struct SourceTotals {
     #[serde(default)]
     pub invalid: usize,
     #[serde(default)]
-    pub out_of_region: usize,
+    pub orphaned: usize,
+    #[serde(default)]
+    pub merged: usize,
     #[serde(default)]
     pub unchanged: usize,
     #[serde(default)]
     pub written: usize,
 }
 
+pub struct Dossier {
+    pub company: Company,
+    pub account: Option<Account>,
+    pub signals: Vec<Signal>,
+    pub activities: Vec<Activity>,
+}
+
 impl Store {
-    pub fn new(client: Client, region: RegionConfig, bot_health_url: String) -> Self {
+    pub fn new(client: Client, market: MarketConfig, bot_health_url: String) -> Self {
         Self {
             client,
-            region,
+            market,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -117,95 +111,108 @@ impl Store {
         }
     }
 
+    async fn search<T: DeserializeOwned + Send + Sync + 'static>(
+        &self,
+        index: &str,
+        query: &str,
+        filter: &str,
+        sort: &[&str],
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<T>, usize)> {
+        let idx = self.client.index(index);
+        let mut q = SearchQuery::new(&idx);
+        q.with_query(query).with_limit(limit).with_offset(offset);
+        if !filter.is_empty() {
+            q.with_filter(filter);
+        }
+        if !sort.is_empty() {
+            q.with_sort(sort);
+        }
+        let res = q
+            .execute::<T>()
+            .await
+            .with_context(|| format!("searching {index}"))?;
+        let total = res.estimated_total_hits.unwrap_or(res.hits.len());
+        Ok((res.hits.into_iter().map(|h| h.result).collect(), total))
+    }
+
+    async fn facet(&self, index: &str, field: &str, filter: &str) -> BTreeMap<String, usize> {
+        let idx = self.client.index(index);
+        let facets = [field];
+        let mut q = SearchQuery::new(&idx);
+        q.with_query("")
+            .with_limit(0)
+            .with_facets(Selectors::Some(&facets));
+        if !filter.is_empty() {
+            q.with_filter(filter);
+        }
+        match q.execute::<Value>().await {
+            Ok(r) => r
+                .facet_distribution
+                .and_then(|mut d| d.remove(field))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            Err(e) => {
+                tracing::warn!(index, field, error = %e, "facet lookup failed");
+                Default::default()
+            }
+        }
+    }
+
     // ------------------------------------------------------------- overview
 
     pub async fn overview(&self) -> Overview {
         let mut o = Overview::default();
-        for index in CONTENT_INDEXES {
-            let n = match self.client.index(index).get_stats().await {
-                Ok(s) => s.number_of_documents,
-                Err(e) => {
-                    tracing::warn!(index, error = %e, "could not read index stats");
-                    0
-                }
+        for (index, field) in [
+            (COMPANIES, "updated_at"),
+            (SIGNALS, "occurred_at"),
+            (ACCOUNTS, "updated_at"),
+            (ACTIVITIES, "occurred_at"),
+        ] {
+            let filter = if index == COMPANIES {
+                "merged_into NOT EXISTS"
+            } else {
+                ""
             };
+            let n = self
+                .search::<Value>(index, "", filter, &[], 0, 0)
+                .await
+                .map(|(_, n)| n)
+                .ok();
             o.documents.insert(index.to_string(), n);
-            o.freshest
-                .insert(index.to_string(), self.newest(index).await);
+            let sort = format!("{field}:desc");
+            let newest = self
+                .search::<Value>(index, "", "", &[sort.as_str()], 1, 0)
+                .await
+                .ok()
+                .and_then(|(v, _)| v.first()?.get(field)?.as_i64());
+            o.freshest.insert(index.to_string(), newest);
         }
-        o.submissions = self.submission_counts().await;
-        o.top_categories = self.top_categories(20).await;
-        o.bot = self.bot_health().await;
-        o
-    }
-
-    async fn newest(&self, index: &str) -> Option<i64> {
-        #[derive(Deserialize)]
-        struct Row {
-            #[serde(default)]
-            updated_at: Option<i64>,
-        }
-        let idx = self.client.index(index);
-        let sort = ["updated_at:desc"];
-        let mut q = SearchQuery::new(&idx);
-        q.with_query("").with_limit(1).with_sort(&sort);
-        q.execute::<Row>()
-            .await
-            .ok()?
-            .hits
-            .first()
-            .and_then(|h| h.result.updated_at)
-    }
-
-    async fn top_categories(&self, n: usize) -> Vec<(String, usize)> {
-        let idx = self.client.index(regional_core::index::PLACES);
-        let facets = ["categories"];
-        let mut q = SearchQuery::new(&idx);
-        q.with_query("")
-            .with_limit(0)
-            .with_facets(Selectors::Some(&facets));
-        let Ok(res) = q.execute::<Value>().await else {
-            return Vec::new();
-        };
-        let mut out: Vec<(String, usize)> = res
-            .facet_distribution
-            .and_then(|mut d| d.remove("categories"))
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        out.truncate(n);
-        out
-    }
-
-    /// How many submissions sit in each status. Drives the queue badges.
-    pub async fn submission_counts(&self) -> BTreeMap<String, usize> {
-        let idx = self.client.index(SUBMISSIONS);
-        let facets = ["status"];
-        let mut q = SearchQuery::new(&idx);
-        q.with_query("")
-            .with_limit(0)
-            .with_facets(Selectors::Some(&facets));
-        let dist = match q.execute::<Value>().await {
-            Ok(r) => r
-                .facet_distribution
-                .and_then(|mut d| d.remove("status"))
-                .unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read submission counts");
-                Default::default()
-            }
-        };
-        // Always report every status, so "0 pending" is visible rather than
-        // an absent row that reads as a broken page.
-        let mut out = BTreeMap::new();
-        for s in Status::ALL {
-            out.insert(
+        let pipeline = self.facet(ACCOUNTS, "status", "").await;
+        // Always report every status, so "0 meeting" is visible rather than
+        // an absent chip that reads as a broken page.
+        for s in AccountStatus::ALL {
+            o.pipeline.insert(
                 s.as_str().to_string(),
-                dist.get(s.as_str()).copied().unwrap_or(0),
+                pipeline.get(s.as_str()).copied().unwrap_or(0),
             );
         }
-        out
+        o.by_vertical = self
+            .facet(COMPANIES, "verticals", "merged_into NOT EXISTS")
+            .await;
+        let since = crm_core::model::now_ts() - 30 * 86_400;
+        o.signals_30d = self
+            .facet(SIGNALS, "kind", &format!("occurred_at >= {since}"))
+            .await;
+        o.pending_requests = self
+            .search::<Value>(COMPANY_REQUESTS, "", "status = \"pending\"", &[], 0, 0)
+            .await
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        o.bot = self.bot_health().await;
+        o
     }
 
     async fn bot_health(&self) -> Option<BotHealth> {
@@ -228,125 +235,116 @@ impl Store {
         }
     }
 
-    // ---------------------------------------------------------- submissions
+    // ------------------------------------------------------------- accounts
 
-    pub async fn create(&self, submission: &Submission) -> Result<()> {
-        meili::upsert_chunked(&self.client, SUBMISSIONS, std::slice::from_ref(submission))
-            .await
-            .context("storing the submission")?;
-        Ok(())
-    }
-
-    pub async fn get(&self, id: &str) -> Option<Submission> {
-        self.client
-            .index(SUBMISSIONS)
-            .get_document::<Submission>(id)
-            .await
-            .ok()
-    }
-
-    pub async fn list(
+    pub async fn accounts(
         &self,
-        status: Option<Status>,
-        request: Option<Request>,
+        status: Option<AccountStatus>,
         query: &str,
         offset: usize,
-    ) -> Result<(Vec<Submission>, usize)> {
-        let mut clauses: Vec<String> = Vec::new();
-        if let Some(s) = status {
-            clauses.push(format!("status = \"{}\"", s.as_str()));
-        }
-        if let Some(r) = request {
-            clauses.push(format!("request = \"{}\"", r.as_str()));
-        }
-        let filter = clauses.join(" AND ");
-
-        let idx = self.client.index(SUBMISSIONS);
-        let sort = ["submitted_at:desc"];
-        let mut q = SearchQuery::new(&idx);
-        q.with_query(query)
-            .with_limit(PAGE_SIZE)
-            .with_offset(offset)
-            .with_sort(&sort);
-        if !filter.is_empty() {
-            q.with_filter(&filter);
-        }
-        let res = q
-            .execute::<Submission>()
-            .await
-            .context("listing submissions")?;
-        let total = res.estimated_total_hits.unwrap_or(res.hits.len());
-        Ok((res.hits.into_iter().map(|h| h.result).collect(), total))
+    ) -> Result<(Vec<Account>, usize)> {
+        let filter = status
+            .map(|s| format!("status = \"{}\"", s.as_str()))
+            .unwrap_or_default();
+        self.search(
+            ACCOUNTS,
+            query,
+            &filter,
+            &["updated_at:desc"],
+            PAGE_SIZE,
+            offset,
+        )
+        .await
     }
 
-    /// Record a review decision. Returns the updated submission.
-    pub async fn review(
+    pub async fn dossier(&self, id: &str) -> Option<Dossier> {
+        let company = self
+            .client
+            .index(COMPANIES)
+            .get_document::<Company>(id)
+            .await
+            .ok()?;
+        let account = self
+            .client
+            .index(ACCOUNTS)
+            .get_document::<Account>(id)
+            .await
+            .ok();
+        let q = format!("company_id = \"{id}\"");
+        let signals = self
+            .search(SIGNALS, "", &q, &["occurred_at:desc"], 30, 0)
+            .await
+            .map(|(v, _)| v)
+            .unwrap_or_default();
+        let q = format!("account_id = \"{id}\"");
+        let activities = self
+            .search(ACTIVITIES, "", &q, &["occurred_at:desc"], 100, 0)
+            .await
+            .map(|(v, _)| v)
+            .unwrap_or_default();
+        Some(Dossier {
+            company,
+            account,
+            signals,
+            activities,
+        })
+    }
+
+    // ------------------------------------------------------------ companies
+
+    pub async fn companies(
         &self,
-        id: &str,
-        status: Status,
-        note: Option<String>,
-    ) -> Result<Submission> {
-        let mut sub = self
-            .get(id)
-            .await
-            .with_context(|| format!("no submission with id {id:?}"))?;
-        sub.status = status;
-        sub.review_note = note.filter(|n| !n.trim().is_empty());
-        sub.reviewed_at = Some(now_ts());
-        sub.updated_at = now_ts();
-        // Re-deciding a submission the indexer already choked on should clear
-        // the stale explanation rather than leave it contradicting the state.
-        sub.apply_note = None;
-        self.create(&sub).await?;
-        Ok(sub)
-    }
-
-    // -------------------------------------------------------------- browsing
-
-    /// Search the content indexes, so a reviewer can find the document an
-    /// edit request is talking about and copy its id.
-    pub async fn browse(&self, kind: Option<Kind>, query: &str) -> Result<Vec<BrowseHit>> {
-        let indexes: Vec<&str> = match kind {
-            Some(k) => vec![k.index()],
-            None => CONTENT_INDEXES.to_vec(),
-        };
-        let mut out = Vec::new();
-        for index in indexes {
-            let idx = self.client.index(index);
-            let mut q = SearchQuery::new(&idx);
-            q.with_query(query).with_limit(15);
-            match q.execute::<BrowseHit>().await {
-                Ok(res) => out.extend(res.hits.into_iter().map(|h| h.result)),
-                Err(e) => tracing::warn!(index, error = %e, "browse failed"),
-            }
+        vertical: Option<&str>,
+        query: &str,
+        offset: usize,
+    ) -> Result<(Vec<Company>, usize)> {
+        let mut filter = "merged_into NOT EXISTS".to_string();
+        if let Some(v) = vertical.and_then(|v| self.market.vertical(v)) {
+            filter.push_str(&format!(" AND verticals = \"{}\"", v.slug));
         }
-        Ok(out)
+        let sort: &[&str] = if query.is_empty() {
+            &["last_signal_at:desc"]
+        } else {
+            &[]
+        };
+        self.search(COMPANIES, query, &filter, sort, PAGE_SIZE, offset)
+            .await
     }
 
-    /// Does this document actually exist? Used to validate `existing_id` on
-    /// an edit request before a reviewer wastes time on it.
-    pub async fn document_exists(&self, kind: Kind, id: &str) -> bool {
-        self.client
-            .index(kind.index())
-            .get_document::<Value>(id)
-            .await
-            .is_ok()
+    pub async fn requests(&self) -> Result<Vec<CompanyRequest>> {
+        self.search(
+            COMPANY_REQUESTS,
+            "",
+            "",
+            &["requested_at:desc"],
+            PAGE_SIZE,
+            0,
+        )
+        .await
+        .map(|(v, _)| v)
     }
+}
+
+/// Ids in filter expressions come from URL paths; only hex ids are real.
+pub fn is_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
 mod tests {
-    use regional_core::submission::{Request, Status};
+    use super::*;
 
     #[test]
-    fn statuses_and_requests_are_safe_inside_a_filter() {
-        // These go into Meilisearch filter expressions unquoted-by-hand, so
-        // they must never contain anything that could change the expression.
-        for s in Status::ALL {
+    fn only_hex_ids_reach_a_filter() {
+        assert!(is_id("63276ab7ed80a24f"));
+        assert!(!is_id("x\" OR id = \"y"));
+        assert!(!is_id(""));
+    }
+
+    #[test]
+    fn statuses_are_safe_inside_a_filter() {
+        for s in AccountStatus::ALL {
             assert!(s.as_str().chars().all(|c| c.is_ascii_lowercase()));
-        }
-        for r in Request::ALL {
-            assert!(r.as_str().chars().all(|c| c.is_ascii_lowercase()));
         }
     }
 }

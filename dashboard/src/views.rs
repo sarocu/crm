@@ -1,12 +1,13 @@
 //! Shared layout, styling and small rendering helpers.
 //!
 //! Server-rendered with maud, which escapes interpolated values by default —
-//! worth having when a page echoes text that anyone on the internet typed
-//! into the public form. Nothing is loaded from a CDN, so both pages work on
-//! a locked-down network and inside a VM with no egress.
+//! worth having when a page echoes text scraped from company websites and
+//! written by an agent. Nothing is loaded from a CDN, so the pages work on a
+//! locked-down network and inside a VM with no egress.
 
+use crm_core::model::AccountStatus;
+use crm_core::request::RequestStatus;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
-use regional_core::submission::{Request, Status};
 
 pub const STYLE: &str = r#"
 :root {
@@ -88,11 +89,11 @@ td.nowrap, th.nowrap { white-space: nowrap; }
   display: inline-block; padding: 1px 8px; border-radius: 999px;
   font-size: 12px; font-weight: 600; white-space: nowrap;
 }
-.badge.pending  { background: var(--warn-soft); color: var(--warn); }
-.badge.approved { background: var(--info-soft); color: var(--info); }
-.badge.applied  { background: var(--ok-soft);   color: var(--ok); }
-.badge.rejected { background: var(--off-soft);  color: var(--off); }
-.badge.plain    { background: var(--surface-2); color: var(--muted); }
+.badge.warn  { background: var(--warn-soft); color: var(--warn); }
+.badge.info  { background: var(--info-soft); color: var(--info); }
+.badge.ok    { background: var(--ok-soft);   color: var(--ok); }
+.badge.off   { background: var(--off-soft);  color: var(--off); }
+.badge.plain { background: var(--surface-2); color: var(--muted); }
 
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
 .chips a {
@@ -190,12 +191,24 @@ pub fn page(brand: &str, brand_href: &str, nav: Option<&Nav>, title: &str, body:
     }
 }
 
-pub fn status_badge(s: Status) -> Markup {
-    html! { span class={ "badge " (s.as_str()) } { (s.as_str()) } }
+/// Colour by how far along the funnel an account is.
+pub fn status_badge(s: AccountStatus) -> Markup {
+    let class = match s {
+        AccountStatus::New | AccountStatus::Researching | AccountStatus::Queued => "plain",
+        AccountStatus::Contacted | AccountStatus::Nurture => "info",
+        AccountStatus::Engaged | AccountStatus::Meeting => "warn",
+        AccountStatus::Qualified => "ok",
+        AccountStatus::Disqualified => "off",
+    };
+    html! { span class={ "badge " (class) } { (s.as_str()) } }
 }
 
-pub fn request_badge(r: Request) -> Markup {
-    html! { span."badge"."plain" { (r.as_str()) } }
+pub fn request_class(s: RequestStatus) -> &'static str {
+    match s {
+        RequestStatus::Pending => "warn",
+        RequestStatus::Applied => "ok",
+        RequestStatus::Failed => "off",
+    }
 }
 
 /// Absolute UTC, which is what an operator reconciling logs actually wants.
@@ -207,7 +220,7 @@ pub fn ts(t: i64) -> String {
 
 /// "4 minutes ago" — the at-a-glance form, paired with the absolute one.
 pub fn ago(t: i64) -> String {
-    let secs = (regional_core::model::now_ts() - t).max(0);
+    let secs = (crm_core::model::now_ts() - t).max(0);
     let (n, unit) = match secs {
         s if s < 60 => return "just now".into(),
         s if s < 3_600 => (s / 60, "minute"),
@@ -234,7 +247,7 @@ mod tests {
 
     #[test]
     fn interpolated_text_is_escaped() {
-        // The public form echoes whatever anyone types; maud must escape it.
+        // Pages echo scraped and agent-written text; maud must escape it.
         let body = html! { p { "<script>alert(1)</script>" } };
         let out = page("B", "/", None, "T", body).into_string();
         assert!(out.contains("&lt;script&gt;"), "{out}");
@@ -243,7 +256,7 @@ mod tests {
 
     #[test]
     fn relative_times_read_naturally() {
-        let now = regional_core::model::now_ts();
+        let now = crm_core::model::now_ts();
         assert_eq!(ago(now), "just now");
         assert_eq!(ago(now - 60), "1 minute ago");
         assert_eq!(ago(now - 7_200), "2 hours ago");

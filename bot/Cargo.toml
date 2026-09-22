@@ -6,7 +6,7 @@ license.workspace = true
 description = "Continuous indexer feeding the regional Meilisearch index"
 
 [dependencies]
-regional-core.workspace = true
+crm-core.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -23,7 +23,6 @@ url.workspace = true
 
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = [
-    "form",
     "json",
     "gzip",
     "rustls",
@@ -31,6 +30,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "charset",
     "http2",
 ] }
+feed-rs = "2.4"
+regex = "1.13"
 scraper = "0.27"
 texting_robots = "0.2"
 

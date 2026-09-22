@@ -7,18 +7,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use url::Url;
 
-/// A crawl seed, optionally pinned to a town.
-///
-/// `CRAWL_SEEDS` accepts `https://site.example|Denver`: pages from that site
-/// that carry no coordinates of their own are attributed to that town
-/// (recorded as `geo_precision: city`). Without it, a page we cannot locate
-/// is dropped rather than indexed at an invented position.
-#[derive(Debug, Clone)]
-pub struct Seed {
-    pub url: Url,
-    pub default_city: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -28,17 +16,23 @@ pub struct Config {
     pub once: bool,
     pub intervals: HashMap<String, Duration>,
     pub disabled_sources: Vec<String>,
-    pub crawl_seeds: Vec<Seed>,
+    /// Extra homepages to crawl on top of the companies other sources find.
+    pub crawl_seeds: Vec<Url>,
     pub crawl_max_depth: u32,
     pub crawl_pages_per_run: usize,
-    pub overpass_url: String,
-    /// Target size of one Overpass tile, km per side. The tile count follows
-    /// from the region's area; lower this if queries start timing out.
-    pub overpass_tile_km: f64,
-    pub nominatim_url: String,
-    pub wikipedia_api: String,
-    pub wikidata_api: String,
-    pub wikipedia_points_per_run: usize,
+    /// Company homepages queued for crawling per run.
+    pub crawl_companies_per_run: usize,
+    /// Extra RSS/Atom feeds on top of the ones the market config names.
+    pub news_feeds: Vec<Url>,
+    pub edgar_tickers_url: String,
+    pub edgar_submissions_url: String,
+    pub edgar_per_run: usize,
+    /// How far back a filing still counts as a signal.
+    pub edgar_filing_days: i64,
+    pub wikidata_sparql: String,
+    pub wikidata_page_size: usize,
+    /// Companies whose job boards are polled per run.
+    pub jobs_per_run: usize,
 }
 
 impl Config {
@@ -58,29 +52,26 @@ impl Config {
         let host = std::env::var("BIND_HOST").unwrap_or_else(|_| "0.0.0.0".into());
         let bind: SocketAddr = format!("{host}:{port}").parse()?;
 
-        // OpenStreetMap, Wikimedia and Nominatim all require a real contact
-        // in the User-Agent and will block anonymous bulk traffic. Refusing
-        // to start is friendlier than getting quietly banned an hour in.
+        // The SEC and Wikimedia both require a real contact in the
+        // User-Agent and block anonymous bulk traffic. Refusing to start is
+        // friendlier than getting quietly banned an hour in.
         let contact_email = std::env::var("CONTACT_EMAIL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s.contains('@'))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "CONTACT_EMAIL must be set to a real address you monitor. OpenStreetMap, \
-                     Wikimedia and Nominatim require it in the User-Agent and will block \
-                     traffic without it."
+                    "CONTACT_EMAIL must be set to a real address you monitor. SEC EDGAR and \
+                     Wikimedia require it in the User-Agent and will block traffic without it."
                 )
             })?;
         let user_agent = format!(
-            "regional-indexer/{} (+{contact_email})",
+            "crm-indexer/{} (+{contact_email})",
             env!("CARGO_PKG_VERSION")
         );
 
         let intervals = parse_intervals(std::env::var("SOURCE_INTERVALS").ok().as_deref())?;
         let disabled_sources = split_csv(std::env::var("DISABLED_SOURCES").ok().as_deref());
-
-        let crawl_seeds = parse_seeds(std::env::var("CRAWL_SEEDS").ok().as_deref())?;
 
         Ok(Self {
             bind,
@@ -88,22 +79,21 @@ impl Config {
             once,
             intervals,
             disabled_sources,
-            crawl_seeds,
-            crawl_max_depth: env_num("CRAWL_MAX_DEPTH", 3)?,
+            crawl_seeds: parse_urls("CRAWL_SEEDS", std::env::var("CRAWL_SEEDS").ok().as_deref())?,
+            crawl_max_depth: env_num("CRAWL_MAX_DEPTH", 2)?,
             crawl_pages_per_run: env_num("CRAWL_PAGES_PER_RUN", 40)?,
-            overpass_url: std::env::var("OVERPASS_URL")
-                .unwrap_or_else(|_| "https://overpass-api.de/api/interpreter".into()),
-            overpass_tile_km: env_num(
-                "OVERPASS_TILE_KM",
-                crate::sources::overpass::DEFAULT_TILE_KM,
-            )?,
-            nominatim_url: std::env::var("NOMINATIM_URL")
-                .unwrap_or_else(|_| "https://nominatim.openstreetmap.org".into()),
-            wikipedia_api: std::env::var("WIKIPEDIA_API")
-                .unwrap_or_else(|_| "https://en.wikipedia.org/w/api.php".into()),
-            wikidata_api: std::env::var("WIKIDATA_API")
-                .unwrap_or_else(|_| "https://www.wikidata.org/w/api.php".into()),
-            wikipedia_points_per_run: env_num("WIKIPEDIA_POINTS_PER_RUN", 25)?,
+            crawl_companies_per_run: env_num("CRAWL_COMPANIES_PER_RUN", 100)?,
+            news_feeds: parse_urls("NEWS_FEEDS", std::env::var("NEWS_FEEDS").ok().as_deref())?,
+            edgar_tickers_url: std::env::var("EDGAR_TICKERS_URL")
+                .unwrap_or_else(|_| "https://www.sec.gov/files/company_tickers.json".into()),
+            edgar_submissions_url: std::env::var("EDGAR_SUBMISSIONS_URL")
+                .unwrap_or_else(|_| "https://data.sec.gov/submissions".into()),
+            edgar_per_run: env_num("EDGAR_PER_RUN", 200)?,
+            edgar_filing_days: env_num("EDGAR_FILING_DAYS", 180)?,
+            wikidata_sparql: std::env::var("WIKIDATA_SPARQL")
+                .unwrap_or_else(|_| "https://query.wikidata.org/sparql".into()),
+            wikidata_page_size: env_num("WIKIDATA_PAGE_SIZE", 200)?,
+            jobs_per_run: env_num("JOBS_PER_RUN", 25)?,
         })
     }
 
@@ -138,7 +128,7 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Parse `overpass=6h,wikipedia=30m,crawl=15m`.
+/// Parse `edgar=6h,wikidata=1d,crawl=15m`.
 fn parse_intervals(raw: Option<&str>) -> Result<HashMap<String, Duration>> {
     let mut out = HashMap::new();
     for entry in split_csv(raw) {
@@ -173,25 +163,15 @@ pub fn parse_duration(raw: &str) -> Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
-fn parse_seeds(raw: Option<&str>) -> Result<Vec<Seed>> {
+fn parse_urls(var: &str, raw: Option<&str>) -> Result<Vec<Url>> {
     let mut out = Vec::new();
     for entry in split_csv(raw) {
-        let (url_part, city) = match entry.split_once('|') {
-            Some((u, c)) => (
-                u.trim(),
-                Some(c.trim().to_string()).filter(|c| !c.is_empty()),
-            ),
-            None => (entry.as_str(), None),
-        };
-        let url = Url::parse(url_part)
-            .with_context(|| format!("CRAWL_SEEDS entry {url_part:?} is not a valid URL"))?;
+        let url = Url::parse(&entry)
+            .with_context(|| format!("{var} entry {entry:?} is not a valid URL"))?;
         if !matches!(url.scheme(), "http" | "https") {
-            bail!("CRAWL_SEEDS entry {url_part:?} must be http or https");
+            bail!("{var} entry {entry:?} must be http or https");
         }
-        out.push(Seed {
-            url,
-            default_city: city,
-        });
+        out.push(url);
     }
     Ok(out)
 }
@@ -213,19 +193,17 @@ mod tests {
 
     #[test]
     fn intervals_parse_as_a_map() {
-        let m = parse_intervals(Some("overpass=6h, crawl=15m")).unwrap();
-        assert_eq!(m["overpass"], Duration::from_secs(21600));
+        let m = parse_intervals(Some("edgar=6h, crawl=15m")).unwrap();
+        assert_eq!(m["edgar"], Duration::from_secs(21600));
         assert_eq!(m["crawl"], Duration::from_secs(900));
         assert!(parse_intervals(Some("bogus")).is_err());
     }
 
     #[test]
-    fn seeds_carry_an_optional_default_city() {
-        let s = parse_seeds(Some("https://a.test/news|Denver, https://b.test")).unwrap();
+    fn url_lists_reject_junk() {
+        let s = parse_urls("X", Some("https://a.test/feed, https://b.test")).unwrap();
         assert_eq!(s.len(), 2);
-        assert_eq!(s[0].default_city.as_deref(), Some("Denver"));
-        assert_eq!(s[1].default_city, None);
-        assert!(parse_seeds(Some("ftp://a.test")).is_err());
-        assert!(parse_seeds(Some("not a url")).is_err());
+        assert!(parse_urls("X", Some("ftp://a.test")).is_err());
+        assert!(parse_urls("X", Some("not a url")).is_err());
     }
 }
